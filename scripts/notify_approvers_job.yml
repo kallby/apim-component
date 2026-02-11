@@ -1,0 +1,47 @@
+# ============================================
+# Reusable Notification Job Template
+#
+# Include this in your pipeline to send email
+# notifications when jobs are pending approval.
+#
+# Required CI/CD Variables:
+#   GITLAB_TOKEN     - GitLab API token (with read_api scope, admin for emails)
+#   SMTP_HOST        - SMTP server hostname
+#   SMTP_FROM        - From email address
+#
+# Optional CI/CD Variables:
+#   SMTP_PORT        - SMTP port (default: 25)
+#
+# Usage in component:
+#   notify_approvers:
+#     extends: .notify_approvers_base
+#     needs: ["plan"]
+#     rules:
+#       - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_|clear_|create_|update_|delete_)/
+# ============================================
+
+.notify_approvers_base:
+  stage: plan
+  image: python:3.11-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  cache:
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install --quiet requests
+  script:
+    - |
+      echo "Sending approval notification emails..."
+
+      # Download the notification script if not present
+      if [ ! -f "scripts/notify_approvers.py" ]; then
+        echo "Notification script not found locally, creating inline..."
+        mkdir -p scripts
+        cat > scripts/notify_approvers.py << 'SCRIPT_EOF'
+      ${NOTIFY_SCRIPT_CONTENT}
+      SCRIPT_EOF
+      fi
+
+      python scripts/notify_approvers.py
+  allow_failure: true  # Don't fail the pipeline if notification fails

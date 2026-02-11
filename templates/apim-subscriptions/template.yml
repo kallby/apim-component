@@ -1,0 +1,2347 @@
+# ============================================
+# APIM Subscriptions Management Component
+#
+# A reusable CI/CD component for managing Subscriptions
+# in Azure API Management with full key management.
+#
+# Usage:
+#   include:
+#     - component: $CI_SERVER_FQDN/devops/components/api-management/apim-subscriptions@1.0.0
+#
+# Then run the pipeline and fill in the variables in the UI.
+#
+# ============================================
+# Required CI/CD Variables (set in consuming project):
+#
+# Azure - Shared:
+#   AZ_TENANT_ID
+#
+# Azure - Per environment (DEV, TST, STG, PRD):
+#   {ENV}_AZ_SPN_CLIENT_ID
+#   {ENV}_AZ_SPN_CLIENT_SECRET
+#   {ENV}_AZ_SUBSCRIPTION_ID
+#   {ENV}_RESOURCE_GROUP
+#   {ENV}_APIM_SERVICE
+# ============================================
+
+spec:
+  inputs: {}
+
+---
+
+# ============================================
+# Pipeline Variables (shown in Run Pipeline UI)
+# ============================================
+variables:
+  # -----------------------------------------------
+  # Container Images (self-hosted in GitLab registry)
+  # Change these to point to your internal registry
+  # -----------------------------------------------
+  IMAGE_AZURE_CLI: "${CI_REGISTRY}/devops/images/azure-cli:latest"
+  IMAGE_PYTHON: "${CI_REGISTRY}/devops/images/python:3.11-slim"
+  IMAGE_ALPINE: "${CI_REGISTRY}/devops/images/alpine:latest"
+
+  # Internal variables
+  AZURE_API_VERSION: "2022-08-01"
+
+  # -----------------------------------------------
+  # User-provided variables (shown in Run Pipeline UI)
+  # -----------------------------------------------
+
+  OPERATION:
+    value: "list_subscriptions"
+    description: "Operation to perform"
+    options:
+      # Read operations
+      - "list_subscriptions"
+      - "get_subscription"
+      # Sensitive operation (shows keys)
+      - "get_subscription_keys"
+      # Write operations
+      - "create_subscription"
+      - "delete_subscription"
+      - "regenerate_primary_key"
+      - "regenerate_secondary_key"
+      - "regenerate_both_keys"
+
+  SUBSCRIPTION_ID:
+    value: ""
+    description: "Subscription ID (for get/delete/keys/regenerate operations)"
+
+  SUBSCRIPTION_NAME:
+    value: ""
+    description: "Display name for new subscription (for create)"
+
+  SCOPE_TYPE:
+    value: "product"
+    description: "Subscription scope type"
+    options:
+      - "product"    # Subscription to a specific product
+      - "api"        # Subscription to a specific API
+      - "all_apis"   # Service-level subscription (access to all APIs)
+
+  SCOPE_ID:
+    value: ""
+    description: "Product ID or API ID (required for product/api scope, ignored for all_apis)"
+
+  SUBSCRIPTION_STATE:
+    value: "active"
+    description: "Initial subscription state"
+    options:
+      - "active"
+      - "suspended"
+      - "cancelled"
+
+  ALLOW_TRACING:
+    value: "false"
+    description: "Enable tracing for the subscription"
+    options:
+      - "true"
+      - "false"
+
+  # SEND_KEYS_VIA_EMAIL:
+  #   value: "true"
+  #   description: "Send subscription keys via secure email instead of displaying in logs"
+  #   options:
+  #     - "true"
+  #     - "false"
+
+  SEND_KEYS_VIA_EMAIL: true
+
+  AUTO_SEND_KEYS:
+    value: "true"
+    description: "Automatically send keys after create/regenerate operations"
+    options:
+      - "true"
+      - "false"
+
+  DEBUG_MODE:
+    value: "false"
+    description: "Enable debug/verbose output for troubleshooting"
+    options:
+      - "false"
+      - "true"
+
+# ============================================
+# Stages
+# ============================================
+stages:
+  - list
+  - validate
+  - plan
+  - notify
+  - deploy
+
+# ============================================
+# Logging Functions
+# ============================================
+.logging_functions: &logging_functions
+  - |
+    log_info()  { echo "[INFO]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_warn()  { echo "[WARN]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_error() { echo "[ERROR] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >&2; }
+    log_ok()    { echo "[OK]    $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_debug() { [ "$DEBUG_MODE" = "true" ] && echo "[DEBUG] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*" || true; }
+
+    # Debug mode controls verbose logging output
+    if [ "$DEBUG_MODE" = "true" ]; then
+      log_info "Debug mode enabled - verbose logging active"
+    fi
+
+# ============================================
+# Audit Functions
+# ============================================
+.audit_functions: &audit_functions
+  - |
+    AUDIT_LOG_FILE="${CI_PROJECT_DIR}/audit-${CI_PIPELINE_ID}.json"
+
+    # Initialize audit log as empty JSON array if it doesn't exist
+    if [ ! -f "$AUDIT_LOG_FILE" ]; then
+      echo "[]" > "$AUDIT_LOG_FILE"
+    fi
+
+    log_audit() {
+      local action="$1"
+      local resource="$2"
+      local details="${3:-}"
+
+      local audit_entry=$(jq -n \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg pipeline_id "${CI_PIPELINE_ID}" \
+        --arg job_id "${CI_JOB_ID}" \
+        --arg job_name "${CI_JOB_NAME}" \
+        --arg triggered_by "${GITLAB_USER_LOGIN:-unknown}" \
+        --arg action "${action}" \
+        --arg resource "${resource}" \
+        --arg environment "${ENV_NAME:-unknown}" \
+        --arg apim_service "${APIM_SERVICE:-unknown}" \
+        --arg details "${details}" \
+        --arg branch "${CI_COMMIT_BRANCH}" \
+        --arg commit_sha "${CI_COMMIT_SHA}" \
+        '{
+          timestamp: $timestamp,
+          pipeline_id: $pipeline_id,
+          job_id: $job_id,
+          job_name: $job_name,
+          triggered_by: $triggered_by,
+          action: $action,
+          resource: $resource,
+          environment: $environment,
+          apim_service: $apim_service,
+          details: $details,
+          branch: $branch,
+          commit_sha: $commit_sha
+        }')
+
+      # Append entry to JSON array
+      jq --argjson entry "$audit_entry" '. += [$entry]' "$AUDIT_LOG_FILE" > "${AUDIT_LOG_FILE}.tmp" && mv "${AUDIT_LOG_FILE}.tmp" "$AUDIT_LOG_FILE"
+      log_info "AUDIT: action=$action resource=$resource"
+    }
+
+# ============================================
+# Set Environment Based on Branch
+# ============================================
+.set_environment: &set_environment
+  - |
+    case "$CI_COMMIT_BRANCH" in
+      dev|develop)
+        export ENV_NAME="dev"
+        export AZ_SPN_CLIENT_ID="$DEV_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$DEV_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$DEV_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$DEV_RESOURCE_GROUP"
+        export APIM_SERVICE="$DEV_APIM_SERVICE"
+        ;;
+      tst|test)
+        export ENV_NAME="tst"
+        export AZ_SPN_CLIENT_ID="$TST_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$TST_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$TST_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$TST_RESOURCE_GROUP"
+        export APIM_SERVICE="$TST_APIM_SERVICE"
+        ;;
+      stg|staging)
+        export ENV_NAME="stg"
+        export AZ_SPN_CLIENT_ID="$STG_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$STG_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$STG_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$STG_RESOURCE_GROUP"
+        export APIM_SERVICE="$STG_APIM_SERVICE"
+        ;;
+      prd|main)
+        export ENV_NAME="prd"
+        export AZ_SPN_CLIENT_ID="$PRD_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$PRD_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$PRD_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$PRD_RESOURCE_GROUP"
+        export APIM_SERVICE="$PRD_APIM_SERVICE"
+        ;;
+      *)
+        log_error "Unsupported branch: $CI_COMMIT_BRANCH"
+        log_error "Use: dev/develop, tst/test, stg/staging, or prd/main"
+        exit 1
+        ;;
+    esac
+    log_info "Environment: $ENV_NAME"
+    log_info "APIM Service: $APIM_SERVICE"
+
+# ============================================
+# Azure Login
+# ============================================
+.azure_login: &azure_login
+  - |
+    log_info "Logging into Azure..."
+    if [ -z "$AZ_SPN_CLIENT_ID" ] || [ -z "$AZ_SPN_CLIENT_SECRET" ] || [ -z "$AZ_TENANT_ID" ]; then
+      log_error "Missing Azure credentials for environment $ENV_NAME"
+      exit 1
+    fi
+
+    az login --service-principal \
+      --username "$AZ_SPN_CLIENT_ID" \
+      --password "$AZ_SPN_CLIENT_SECRET" \
+      --tenant "$AZ_TENANT_ID" \
+      --output none
+
+    az account set --subscription "$AZ_SUBSCRIPTION_ID"
+    log_ok "Azure login successful"
+
+# ============================================
+# Build API URLs
+# ============================================
+.build_api_urls: &build_api_urls
+  - |
+    export APIM_BASE_URL="https://management.azure.com/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}"
+    export SUBSCRIPTIONS_URL="${APIM_BASE_URL}/subscriptions?api-version=${AZURE_API_VERSION}"
+    log_info "APIM Base URL configured"
+
+# ============================================
+# Reusable Script: Fetch and Send Keys
+# Used by create_subscription and regenerate operations
+# ============================================
+.fetch_and_send_keys: &fetch_and_send_keys
+  - |
+    fetch_and_send_keys() {
+      local SUBSCRIPTION_ID="$1"
+      local OPERATION_TYPE="$2"  # e.g., "created", "regenerated"
+
+      log_info "Fetching subscription keys..."
+
+      SECRETS_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/listSecrets?api-version=${AZURE_API_VERSION}"
+
+      HTTP_RESPONSE=$(az rest --method POST \
+        --url "$SECRETS_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+
+      if ! echo "$HTTP_RESPONSE" | jq -e '.primaryKey' > /dev/null 2>&1; then
+        log_error "Failed to retrieve subscription keys"
+        log_error "Error: $HTTP_RESPONSE"
+        return 1
+      fi
+
+      PRIMARY_KEY=$(echo "$HTTP_RESPONSE" | jq -r '.primaryKey')
+      SECONDARY_KEY=$(echo "$HTTP_RESPONSE" | jq -r '.secondaryKey')
+
+      # Check if we should send via email or display in logs
+      SEND_VIA_EMAIL="$SEND_KEYS_VIA_EMAIL"
+
+      if [ "$SEND_VIA_EMAIL" = "true" ]; then
+        log_info "SEND_KEYS_VIA_EMAIL=true - sending keys via secure email"
+
+        # Determine recipient email (default EMAIL_DOMAIN to lazard.com)
+        EMAIL_DOMAIN="${EMAIL_DOMAIN:-lazard.com}"
+        RECIPIENT_EMAIL="${GITLAB_USER_EMAIL:-}"
+        if [ -z "$RECIPIENT_EMAIL" ] && [ -n "$GITLAB_USER_LOGIN" ]; then
+          RECIPIENT_EMAIL="${GITLAB_USER_LOGIN}@${EMAIL_DOMAIN}"
+        fi
+
+        if [ -z "$RECIPIENT_EMAIL" ]; then
+          log_error "Cannot send email: No recipient email available"
+          log_error "GITLAB_USER_LOGIN not available"
+          log_warn "Falling back to displaying keys in logs..."
+          SEND_VIA_EMAIL="false"
+        fi
+
+        if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_FROM" ]; then
+          log_error "Cannot send email: SMTP_HOST or SMTP_FROM not configured"
+          log_warn "Falling back to displaying keys in logs..."
+          SEND_VIA_EMAIL="false"
+        fi
+      fi
+
+      if [ "$SEND_VIA_EMAIL" = "true" ]; then
+        log_info "Sending keys to: $RECIPIENT_EMAIL"
+
+        # Export variables for Python script
+        export RECIPIENT_EMAIL
+        export PRIMARY_KEY
+        export SECONDARY_KEY
+        export SUBSCRIPTION_ID
+        export OPERATION_TYPE
+
+        # Create and run email script
+        python3 << PYTHON_SCRIPT
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.utils import formataddr
+    from datetime import datetime, timezone, timedelta
+
+    smtp_host = os.environ.get('SMTP_HOST')
+    smtp_from = os.environ.get('SMTP_FROM')
+    smtp_from_name = os.environ.get('SMTP_FROM_NAME', 'APIM Pipeline')
+    smtp_port = int(os.environ.get('SMTP_PORT', '25'))
+    recipient_email = os.environ.get('RECIPIENT_EMAIL')
+    recipient_name = os.environ.get('GITLAB_USER_NAME', 'User')
+
+    subscription_id = os.environ.get('SUBSCRIPTION_ID')
+    subscription_name = os.environ.get('SUBSCRIPTION_NAME', subscription_id)
+    primary_key = os.environ.get('PRIMARY_KEY')
+    secondary_key = os.environ.get('SECONDARY_KEY')
+    apim_service = os.environ.get('APIM_SERVICE')
+    env_name = os.environ.get('ENV_NAME')
+    pipeline_url = os.environ.get('CI_PIPELINE_URL', '')
+    operation_type = os.environ.get('OPERATION_TYPE', 'retrieved')
+
+    # Timestamp
+    eastern = timezone(timedelta(hours=-5))
+    now_eastern = datetime.now(eastern)
+    timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+    env_color = {'prd': '#dc3545', 'stg': '#fd7e14', 'tst': '#17a2b8', 'dev': '#28a745'}.get(env_name, '#6c757d')
+
+    # Subject based on operation type
+    if operation_type == 'created':
+        subject = f'[APIM] [{env_name.upper()}] New Subscription Created: {subscription_name}'
+        header_text = 'New Subscription Created'
+        intro_text = f'A new subscription has been created. Here are your API keys for <span class="env">{env_name.upper()}</span> environment:'
+    elif operation_type == 'regenerated':
+        subject = f'[APIM] [{env_name.upper()}] Keys Regenerated: {subscription_id}'
+        header_text = 'Subscription Keys Regenerated'
+        intro_text = f'Your subscription keys have been regenerated for <span class="env">{env_name.upper()}</span> environment:'
+    else:
+        subject = f'[APIM] [{env_name.upper()}] Subscription Keys: {subscription_id}'
+        header_text = 'Subscription Keys Retrieved'
+        intro_text = f'Your requested subscription keys for <span class="env">{env_name.upper()}</span> environment:'
+
+    html = f'''<!DOCTYPE html><html><head><style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 0; }}
+    .header {{ background: #1f75cb; color: white; padding: 20px; }}
+    .content {{ padding: 20px; background: #f5f5f5; }}
+    .warning {{ background: #fff3cd; border: 1px solid #ffc107; padding: 15px; margin: 15px 0; border-radius: 4px; }}
+    .keys {{ background: white; padding: 20px; margin: 15px 0; border-radius: 4px; border: 1px solid #ddd; }}
+    .key-label {{ font-weight: bold; color: #333; margin-bottom: 5px; }}
+    .key-value {{ font-family: monospace; background: #f8f9fa; padding: 10px; border-radius: 4px; word-break: break-all; margin-bottom: 15px; border: 1px solid #e9ecef; }}
+    .env {{ background: {env_color}; color: white; padding: 3px 10px; font-size: 12px; border-radius: 3px; font-weight: bold; }}
+    .timestamp {{ color: rgba(255,255,255,0.8); font-size: 13px; }}
+    code {{ background: #e9ecef; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
+    </style></head><body>
+    <div class="header">
+        <h2>{header_text}</h2>
+        <span class="timestamp">{timestamp}</span>
+    </div>
+    <div class="content">
+        <div class="warning">
+            <strong>Security Notice:</strong> These are sensitive API keys. Do not forward this email or share these keys with unauthorized parties.
+        </div>
+
+        <p>{intro_text}</p>
+
+        <div class="keys">
+            <p><strong>APIM Service:</strong> <code>{apim_service}</code></p>
+            <p><strong>Subscription ID:</strong> <code>{subscription_id}</code></p>
+            <p><strong>Display Name:</strong> <code>{subscription_name}</code></p>
+
+            <div class="key-label">Primary Key:</div>
+            <div class="key-value">{primary_key}</div>
+
+            <div class="key-label">Secondary Key:</div>
+            <div class="key-value">{secondary_key}</div>
+        </div>
+
+        <div class="warning">
+            <strong>Best Practices:</strong>
+            <ul style="margin: 10px 0 0 0; padding-left: 20px;">
+                <li>Store keys in a secure secrets manager (e.g., Azure Key Vault)</li>
+                <li>Never commit keys to source code</li>
+                <li>Rotate keys regularly</li>
+                <li>Use secondary key for zero-downtime rotation</li>
+            </ul>
+        </div>
+
+        <p style="color: #666; font-size: 12px; margin-top: 20px;">
+            From pipeline: <a href="{pipeline_url}">{pipeline_url}</a>
+        </p>
+    </div>
+    </body></html>'''
+
+    text = f'''{header_text.upper()}
+    ==================================================
+
+    SECURITY NOTICE: These are sensitive API keys.
+    Do not share these keys with unauthorized parties.
+
+    Environment: {env_name.upper()}
+    APIM Service: {apim_service}
+    Subscription ID: {subscription_id}
+    Display Name: {subscription_name}
+
+    PRIMARY KEY:
+    {primary_key}
+
+    SECONDARY KEY:
+    {secondary_key}
+
+    ==================================================
+    BEST PRACTICES:
+    - Store keys in a secure secrets manager
+    - Never commit keys to source code
+    - Rotate keys regularly
+
+    Timestamp: {timestamp}
+    Pipeline: {pipeline_url}
+    '''
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = formataddr((smtp_from_name, smtp_from))
+    msg['To'] = recipient_email
+    msg.attach(MIMEText(text, 'plain'))
+    msg.attach(MIMEText(html, 'html'))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+            server.sendmail(smtp_from, [recipient_email], msg.as_string())
+        print(f"[OK] Keys sent to {recipient_email}")
+    except Exception as e:
+        print(f"[ERROR] Failed to send email: {e}")
+        exit(1)
+    PYTHON_SCRIPT
+
+        EMAIL_EXIT_CODE=$?
+        if [ $EMAIL_EXIT_CODE -eq 0 ]; then
+          log_ok "Subscription keys sent via email"
+          echo ""
+          echo "=========================================="
+          echo "  Keys sent to: $RECIPIENT_EMAIL"
+          echo "=========================================="
+          echo ""
+          echo "The subscription keys have been sent to your email."
+          echo "Keys are NOT displayed in this log for security."
+          return 0
+        else
+          log_error "Failed to send email - falling back to log output"
+          SEND_VIA_EMAIL="false"
+        fi
+      fi
+
+      # Fallback: display in logs if email not sent
+      if [ "$SEND_VIA_EMAIL" != "true" ]; then
+        echo ""
+        echo "=========================================="
+        echo "  SECURITY WARNING"
+        echo "=========================================="
+        echo "  The following output contains sensitive API keys."
+        echo "  - Do not share these keys"
+        echo "  - Do not store keys in code or logs"
+        echo "  - Rotate keys regularly"
+        echo "  - Use secondary key for zero-downtime rotation"
+        echo "=========================================="
+        echo ""
+        echo "Subscription Keys:"
+        echo "===================="
+        echo ""
+        echo "Primary Key:"
+        echo "$PRIMARY_KEY"
+        echo ""
+        echo "Secondary Key:"
+        echo "$SECONDARY_KEY"
+        echo ""
+        echo "===================="
+        echo ""
+        echo "TIP: Set SEND_KEYS_VIA_EMAIL=true to receive keys via email instead."
+      fi
+
+      return 0
+    }
+
+# ============================================
+# Stage: List (read-only operations)
+# ============================================
+list_subscriptions:
+  stage: list
+  image: $IMAGE_AZURE_CLI
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "list_subscriptions"
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Subscriptions in $APIM_SERVICE"
+      log_info "=========================================="
+
+      log_debug "Fetching subscription list from $APIM_SERVICE"
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$SUBSCRIPTIONS_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+
+      if echo "$HTTP_RESPONSE" | jq -e '.value' > /dev/null 2>&1; then
+        echo ""
+        echo "Subscription ID | Display Name | Scope Type | Scope ID | State | Created Date"
+        echo "----------------|--------------|------------|----------|-------|-------------"
+        echo "$HTTP_RESPONSE" | jq -r '.value[] |
+          (.properties.scope | split("/")) as $parts |
+          (if ($parts | any(. == "products")) then "product"
+           elif ($parts | any(. == "apis")) then
+             (if ($parts | last) == "apis" or ($parts | last) == "" then "all_apis" else "api" end)
+           else "all_apis" end) as $scopeType |
+          ($parts | last | if . == "apis" or . == "" then "-" else . end) as $scopeId |
+          "\(.name) | \(.properties.displayName) | \($scopeType) | \($scopeId) | \(.properties.state) | \(.properties.createdDate)"'
+        echo ""
+        log_ok "Found $(echo "$HTTP_RESPONSE" | jq '.value | length') subscriptions"
+      else
+        log_error "Failed to list subscriptions"
+        echo "$HTTP_RESPONSE"
+        exit 1
+      fi
+
+get_subscription:
+  stage: list
+  image: $IMAGE_AZURE_CLI
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_subscription"
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Getting Subscription: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      if [ -z "$SUBSCRIPTION_ID" ]; then
+        log_error "SUBSCRIPTION_ID is required"
+        exit 1
+      fi
+
+      SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Fetching subscription details from: $SUBSCRIPTION_URL"
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$SUBSCRIPTION_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+
+      if echo "$HTTP_RESPONSE" | jq -e '.name' > /dev/null 2>&1; then
+        log_ok "Subscription retrieved successfully"
+        echo ""
+        echo "$HTTP_RESPONSE" | jq '
+          (.properties.scope | split("/")) as $parts |
+          (if ($parts | any(. == "products")) then "product"
+           elif ($parts | any(. == "apis")) then
+             (if ($parts | last) == "apis" or ($parts | last) == "" then "all_apis" else "api" end)
+           else "all_apis" end) as $scopeType |
+          ($parts | last | if . == "apis" or . == "" then "-" else . end) as $scopeId |
+          {
+            id: .name,
+            displayName: .properties.displayName,
+            scopeId: .properties.scope,
+            scopeType: $scopeType,
+            scope: $scopeId,
+            state: .properties.state,
+            createdDate: .properties.createdDate,
+            startDate: .properties.startDate,
+            expirationDate: .properties.expirationDate,
+            allowTracing: .properties.allowTracing
+          }'
+        echo ""
+        echo "NOTE: Use 'get_subscription_keys' operation to view the subscription keys."
+      else
+        log_error "Subscription not found: $SUBSCRIPTION_ID"
+        echo "$HTTP_RESPONSE"
+        exit 1
+      fi
+
+# ============================================
+# Stage: Validate
+# ============================================
+validate_inputs:
+  stage: validate
+  image: $IMAGE_ALPINE
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^(list_subscriptions|get_subscription)$/
+  script:
+    - *logging_functions
+    - |
+      log_info "=========================================="
+      log_info "Validating Pipeline Inputs"
+      log_info "=========================================="
+      echo "Operation: $OPERATION"
+      echo "Branch: $CI_COMMIT_BRANCH"
+      echo ""
+
+      # Validate operation
+      case "$OPERATION" in
+        create_subscription|delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
+          log_ok "Valid operation: $OPERATION"
+          ;;
+        *)
+          log_error "Invalid operation: $OPERATION"
+          exit 1
+          ;;
+      esac
+
+      # Validate required inputs per operation
+      case "$OPERATION" in
+        create_subscription)
+          if [ -z "$SUBSCRIPTION_NAME" ]; then
+            log_error "SUBSCRIPTION_NAME is required for create_subscription"
+            exit 1
+          fi
+          if [ -z "$SCOPE_TYPE" ]; then
+            log_error "SCOPE_TYPE is required for create_subscription"
+            exit 1
+          fi
+          # Validate scope-specific requirements
+          case "$SCOPE_TYPE" in
+            product|api)
+              if [ -z "$SCOPE_ID" ]; then
+                log_error "SCOPE_ID is required when SCOPE_TYPE is '$SCOPE_TYPE'"
+                exit 1
+              fi
+              log_info "Scope Type: $SCOPE_TYPE"
+              log_info "Scope ID: $SCOPE_ID"
+              ;;
+            all_apis)
+              log_info "Scope Type: $SCOPE_TYPE (service-level access to all APIs)"
+              if [ -n "$SCOPE_ID" ]; then
+                log_warn "SCOPE_ID is ignored for 'all_apis' scope type"
+              fi
+              ;;
+            *)
+              log_error "Invalid SCOPE_TYPE: $SCOPE_TYPE (valid options: product, api, all_apis)"
+              exit 1
+              ;;
+          esac
+          log_info "Subscription Name: $SUBSCRIPTION_NAME"
+          log_info "Subscription State: $SUBSCRIPTION_STATE"
+          log_info "Allow Tracing: $ALLOW_TRACING"
+          ;;
+        delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
+          if [ -z "$SUBSCRIPTION_ID" ]; then
+            log_error "SUBSCRIPTION_ID is required for $OPERATION"
+            exit 1
+          fi
+          log_info "Subscription ID: $SUBSCRIPTION_ID"
+          ;;
+      esac
+
+      log_ok "All inputs validated successfully"
+
+# ============================================
+# Stage: Plan
+# ============================================
+plan:
+  stage: plan
+  image: $IMAGE_AZURE_CLI
+  needs:
+    - job: validate_inputs
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^(list_subscriptions|get_subscription)$/
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Execution Plan"
+      log_info "=========================================="
+      echo ""
+      echo "Operation:    $OPERATION"
+      echo "Environment:  $ENV_NAME"
+      echo "APIM Service: $APIM_SERVICE"
+      echo ""
+
+      # Validate subscription exists for operations that require it
+      if [ "$OPERATION" != "create_subscription" ] && [ -n "$SUBSCRIPTION_ID" ]; then
+        log_info "Validating subscription ID: $SUBSCRIPTION_ID"
+
+        SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
+        SUBSCRIPTION_RESPONSE=$(az rest --method GET \
+          --url "$SUBSCRIPTION_URL" \
+          --headers "Content-Type=application/json" \
+          --output json 2>&1) || true
+
+        # Check if response is valid JSON and contains subscription data
+        SUBSCRIPTION_VALID=false
+        if echo "$SUBSCRIPTION_RESPONSE" | jq -e '.name' > /dev/null 2>&1; then
+          SUBSCRIPTION_VALID=true
+        fi
+
+        if [ "$SUBSCRIPTION_VALID" = "false" ]; then
+          log_error "=========================================="
+          log_error "SUBSCRIPTION NOT FOUND"
+          log_error "=========================================="
+          log_error ""
+          log_error "The subscription ID '$SUBSCRIPTION_ID' does not exist in $APIM_SERVICE."
+          log_error ""
+          log_error "To find valid subscription IDs:"
+          log_error "  Run the pipeline with OPERATION=list_subscriptions"
+          log_error ""
+          log_error "Common issues:"
+          log_error "  - Typo in the subscription ID"
+          log_error "  - Subscription was deleted"
+          log_error "  - Wrong environment (check you're on the correct branch)"
+          log_error ""
+          exit 1
+        fi
+
+        # Extract and display subscription details for confirmation
+        SUB_DISPLAY_NAME=$(echo "$SUBSCRIPTION_RESPONSE" | jq -r '.properties.displayName // "N/A"')
+        SUB_STATE=$(echo "$SUBSCRIPTION_RESPONSE" | jq -r '.properties.state // "N/A"')
+        SUB_SCOPE=$(echo "$SUBSCRIPTION_RESPONSE" | jq -r '.properties.scope // "N/A"')
+        # Determine scope type and ID using jq/bash (no awk needed)
+        if echo "$SUB_SCOPE" | grep -q "/products/"; then
+          SUB_SCOPE_TYPE="product"
+        elif echo "$SUB_SCOPE" | grep -q "/apis/[^/]"; then
+          SUB_SCOPE_TYPE="api"
+        else
+          SUB_SCOPE_TYPE="all_apis"
+        fi
+        SUB_SCOPE_ID=$(echo "$SUB_SCOPE" | sed 's|.*/||')
+
+        log_ok "Subscription found and validated"
+        echo ""
+        echo "Subscription Details:"
+        echo "  ID:           $SUBSCRIPTION_ID"
+        echo "  Display Name: $SUB_DISPLAY_NAME"
+        echo "  Scope Type:   $SUB_SCOPE_TYPE"
+        echo "  Scope ID:     $SUB_SCOPE_ID"
+        echo "  State:        $SUB_STATE"
+        echo ""
+      fi
+
+      case "$OPERATION" in
+        create_subscription)
+          # Generate the subscription ID that will be used
+          PLAN_SUB_ID="$(echo "$SUBSCRIPTION_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')-$(date +%m%d%Y%H%M)"
+
+          echo "Action: Create new subscription"
+          echo ""
+          echo "Subscription Configuration:"
+          echo "  Subscription ID:         $PLAN_SUB_ID"
+          echo "  Display Name:            $SUBSCRIPTION_NAME"
+          echo "  Scope Type:              $SCOPE_TYPE"
+          case "$SCOPE_TYPE" in
+            product)
+              echo "  Scope:                   Product: $SCOPE_ID"
+              ;;
+            api)
+              echo "  Scope:                   API: $SCOPE_ID"
+              ;;
+            all_apis)
+              echo "  Scope:                   All APIs (service-level)"
+              ;;
+          esac
+          echo "  State:                   $SUBSCRIPTION_STATE"
+          echo "  Allow Tracing:           $ALLOW_TRACING"
+          ;;
+        delete_subscription)
+          echo "Action: DELETE subscription (DESTRUCTIVE)"
+          echo ""
+          echo "  Subscription ID:         $SUBSCRIPTION_ID"
+          echo ""
+          echo "WARNING: This will permanently delete the subscription!"
+          echo "         Any applications using this subscription's keys will lose access."
+          ;;
+        get_subscription_keys)
+          echo "Action: Retrieve subscription keys (SENSITIVE)"
+          echo ""
+          echo "  Subscription ID:         $SUBSCRIPTION_ID"
+          echo ""
+          echo "SECURITY WARNING: This operation will display sensitive API keys."
+          echo "                  Ensure you are in a secure environment."
+          echo "                  Keys should never be shared or stored in logs."
+          ;;
+        regenerate_primary_key)
+          echo "Action: Regenerate PRIMARY key (DESTRUCTIVE)"
+          echo ""
+          echo "  Subscription ID:         $SUBSCRIPTION_ID"
+          echo ""
+          echo "WARNING: This will invalidate the current primary key!"
+          echo "         Any applications using the primary key will lose access."
+          echo "         This action cannot be undone."
+          ;;
+        regenerate_secondary_key)
+          echo "Action: Regenerate SECONDARY key (DESTRUCTIVE)"
+          echo ""
+          echo "  Subscription ID:         $SUBSCRIPTION_ID"
+          echo ""
+          echo "WARNING: This will invalidate the current secondary key!"
+          echo "         Any applications using the secondary key will lose access."
+          echo "         This action cannot be undone."
+          ;;
+        regenerate_both_keys)
+          echo "Action: Regenerate BOTH keys (DESTRUCTIVE)"
+          echo ""
+          echo "  Subscription ID:         $SUBSCRIPTION_ID"
+          echo ""
+          echo "WARNING: This will invalidate BOTH primary and secondary keys!"
+          echo "         ALL applications using this subscription will lose access immediately."
+          echo "         This action cannot be undone."
+          echo ""
+          echo "NOTE: Consider using individual key regeneration for zero-downtime rotation."
+          ;;
+      esac
+
+      echo ""
+      log_info "Plan complete. Approve deploy job to execute."
+
+# ============================================
+# Stage: Notify (send approval notification emails)
+# ============================================
+notify_approvers:
+  stage: notify
+  image: $IMAGE_PYTHON
+  needs: ["plan"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_subscription|delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)$/
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  cache:
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install --quiet requests
+    # Set environment variables based on branch (for email notification and Azure API)
+    - |
+      case "$CI_COMMIT_BRANCH" in
+        dev|develop)
+          export ENV_NAME="dev"
+          export APIM_SERVICE="$DEV_APIM_SERVICE"
+          export AZ_SPN_CLIENT_ID="$DEV_AZ_SPN_CLIENT_ID"
+          export AZ_SPN_CLIENT_SECRET="$DEV_AZ_SPN_CLIENT_SECRET"
+          export AZ_SUBSCRIPTION_ID="$DEV_AZ_SUBSCRIPTION_ID"
+          export RESOURCE_GROUP="$DEV_RESOURCE_GROUP"
+          ;;
+        tst|test)
+          export ENV_NAME="tst"
+          export APIM_SERVICE="$TST_APIM_SERVICE"
+          export AZ_SPN_CLIENT_ID="$TST_AZ_SPN_CLIENT_ID"
+          export AZ_SPN_CLIENT_SECRET="$TST_AZ_SPN_CLIENT_SECRET"
+          export AZ_SUBSCRIPTION_ID="$TST_AZ_SUBSCRIPTION_ID"
+          export RESOURCE_GROUP="$TST_RESOURCE_GROUP"
+          ;;
+        stg|staging)
+          export ENV_NAME="stg"
+          export APIM_SERVICE="$STG_APIM_SERVICE"
+          export AZ_SPN_CLIENT_ID="$STG_AZ_SPN_CLIENT_ID"
+          export AZ_SPN_CLIENT_SECRET="$STG_AZ_SPN_CLIENT_SECRET"
+          export AZ_SUBSCRIPTION_ID="$STG_AZ_SUBSCRIPTION_ID"
+          export RESOURCE_GROUP="$STG_RESOURCE_GROUP"
+          ;;
+        prd|main)
+          export ENV_NAME="prd"
+          export APIM_SERVICE="$PRD_APIM_SERVICE"
+          export AZ_SPN_CLIENT_ID="$PRD_AZ_SPN_CLIENT_ID"
+          export AZ_SPN_CLIENT_SECRET="$PRD_AZ_SPN_CLIENT_SECRET"
+          export AZ_SUBSCRIPTION_ID="$PRD_AZ_SUBSCRIPTION_ID"
+          export RESOURCE_GROUP="$PRD_RESOURCE_GROUP"
+          ;;
+      esac
+  script:
+    - |
+      cat > /tmp/notify_approvers.py << 'PYTHON_SCRIPT'
+      #!/usr/bin/env python3
+      """Send approval notification emails to protected environment approvers."""
+
+      import os
+      import sys
+      import smtplib
+      from email.mime.text import MIMEText
+      from email.mime.multipart import MIMEMultipart
+      from email.utils import formataddr
+      from datetime import datetime, timezone, timedelta
+
+      try:
+          import requests
+      except ImportError:
+          print("[ERROR] requests library not installed")
+          sys.exit(1)
+
+      def log_info(msg): print(f"[INFO]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_warn(msg): print(f"[WARN]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_error(msg): print(f"[ERROR] {datetime.utcnow().isoformat()}Z - {msg}", file=sys.stderr)
+
+      class GitLabClient:
+          def __init__(self, url, token):
+              self.api_url = f"{url.rstrip('/')}/api/v4"
+              self.headers = {'PRIVATE-TOKEN': token}
+
+          def get(self, endpoint):
+              r = requests.get(f"{self.api_url}/{endpoint}", headers=self.headers, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          def get_protected_env(self, project_id, env_name):
+              return self.get(f"projects/{project_id}/protected_environments/{env_name}")
+
+          def get_user(self, user_id):
+              return self.get(f"users/{user_id}")
+
+          def get_group_members(self, group_id):
+              members = []
+              page = 1
+              while True:
+                  result = self.get(f"groups/{group_id}/members/all?page={page}&per_page=100")
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+              return members
+
+          def get_project_members(self, project_id, min_access_level=None):
+              """Get project members, optionally filtered by minimum access level."""
+              members = []
+              page = 1
+              endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+              if min_access_level:
+                  endpoint += f"&min_access_level={min_access_level}"
+              while True:
+                  result = self.get(endpoint)
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+                  endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+                  if min_access_level:
+                      endpoint += f"&min_access_level={min_access_level}"
+              return members
+
+      class AzureClient:
+          """Client for Azure REST API calls."""
+          def __init__(self, tenant_id, client_id, client_secret):
+              self.tenant_id = tenant_id
+              self.client_id = client_id
+              self.client_secret = client_secret
+              self.access_token = None
+
+          def get_access_token(self):
+              """Get Azure AD access token using service principal credentials."""
+              if self.access_token:
+                  return self.access_token
+
+              token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+              data = {
+                  'grant_type': 'client_credentials',
+                  'client_id': self.client_id,
+                  'client_secret': self.client_secret,
+                  'scope': 'https://management.azure.com/.default'
+              }
+
+              try:
+                  response = requests.post(token_url, data=data, timeout=30)
+                  response.raise_for_status()
+                  self.access_token = response.json().get('access_token')
+                  return self.access_token
+              except Exception as e:
+                  log_warn(f"Failed to get Azure access token: {e}")
+                  return None
+
+          def get_subscription_details(self, az_subscription_id, resource_group, apim_service, subscription_id, api_version='2022-08-01'):
+              """Fetch APIM subscription details including scope."""
+              token = self.get_access_token()
+              if not token:
+                  return None
+
+              url = f"https://management.azure.com/subscriptions/{az_subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.ApiManagement/service/{apim_service}/subscriptions/{subscription_id}?api-version={api_version}"
+              headers = {
+                  'Authorization': f'Bearer {token}',
+                  'Content-Type': 'application/json'
+              }
+
+              try:
+                  response = requests.get(url, headers=headers, timeout=30)
+                  response.raise_for_status()
+                  return response.json()
+              except Exception as e:
+                  log_warn(f"Failed to get subscription details: {e}")
+                  return None
+
+      def parse_scope(scope_path):
+          """Parse APIM scope path to extract scope type and ID."""
+          if not scope_path:
+              return None, None, None
+
+          # Scope path examples:
+          # Product: /subscriptions/.../products/my-product
+          # API: /subscriptions/.../apis/my-api
+          # All APIs: /subscriptions/.../apis (no specific API ID)
+
+          parts = scope_path.split('/')
+          if 'products' in parts:
+              idx = parts.index('products')
+              if idx + 1 < len(parts):
+                  return 'product', parts[idx + 1], f"Product: {parts[idx + 1]}"
+          elif 'apis' in parts:
+              idx = parts.index('apis')
+              if idx + 1 < len(parts) and parts[idx + 1]:
+                  return 'api', parts[idx + 1], f"API: {parts[idx + 1]}"
+              else:
+                  return 'all_apis', None, "All APIs (service-level)"
+
+          return None, None, None
+
+      # GitLab access levels
+      ACCESS_LEVEL_DEVELOPER = 30
+      ACCESS_LEVEL_MAINTAINER = 40
+
+      def get_env_from_branch(branch):
+          return {'dev': 'dev', 'develop': 'dev', 'tst': 'tst', 'test': 'tst',
+                  'stg': 'stg', 'staging': 'stg', 'prd': 'prd', 'main': 'prd'}.get(branch, 'dev')
+
+      def get_excluded_emails():
+          """Get list of emails to exclude from notifications (from SMTP_EXCLUDE_EMAILS env var)."""
+          exclude_str = os.environ.get('SMTP_EXCLUDE_EMAILS', '')
+          if not exclude_str:
+              return []
+          return [e.strip().lower() for e in exclude_str.split(',') if e.strip()]
+
+      def is_excluded_email(email):
+          """Check if email should be excluded from notifications."""
+          if not email:
+              return True
+          email_lower = email.lower()
+          # Exclude service account emails (group_*@lazard.com) by default
+          if email_lower.startswith('group_'):
+              return True
+          # Check additional exclusions from SMTP_EXCLUDE_EMAILS
+          excluded = get_excluded_emails()
+          return email_lower in excluded
+
+      def get_user_email(user, email_domain=None):
+          """
+          Try to get user email from various fields.
+          GitLab API email visibility:
+            - 'email': Only visible to admins
+            - 'public_email': Only if user sets it in Profile settings
+            - 'commit_email': User's commit email (may be private)
+          Falls back to constructing email from username if domain provided.
+          """
+          # Try standard email fields
+          email = user.get('email') or user.get('public_email') or user.get('commit_email')
+
+          # Filter out GitLab's private commit email format
+          if email and '@users.noreply' in email:
+              email = None
+
+          # Fallback: construct from username + domain
+          if not email and email_domain:
+              username = user.get('username')
+              if username:
+                  email = f"{username}@{email_domain}"
+
+          return email
+
+      def collect_approvers(gl, project_id, env_name, email_domain=None):
+          approvers = {}
+          try:
+              env_config = gl.get_protected_env(project_id, env_name)
+          except Exception as e:
+              log_warn(f"Could not get protected environment: {e}")
+              return approvers
+
+          # Debug: show what we got from the API
+          log_info(f"Protected environment config keys: {list(env_config.keys())}")
+
+          # Only use approval_rules (not deploy_access_levels)
+          approval_rules = env_config.get('approval_rules', [])
+          log_info(f"Found {len(approval_rules)} approval_rules")
+
+          if not approval_rules:
+              log_warn("No approval_rules found in protected environment")
+              log_warn("Add approvers in Settings > CI/CD > Protected Environments > [env] > Approvers")
+              return approvers
+
+          for access in approval_rules:
+              user_id = access.get('user_id')
+              group_id = access.get('group_id')
+              access_level = access.get('access_level')
+
+              log_info(f"Processing approval rule: user_id={user_id}, group_id={group_id}, access_level={access_level}")
+
+              if user_id:
+                  # Specific user approver
+                  try:
+                      user = gl.get_user(user_id)
+                      email = get_user_email(user, email_domain)
+                      log_info(f"User {user_id} ({user.get('username')}): resolved email={email}")
+                      if email and not is_excluded_email(email):
+                          approvers[email] = user.get('name', 'Unknown')
+                      elif not email:
+                          log_warn(f"User {user_id} ({user.get('name')}, @{user.get('username')}) - no email found")
+                          log_warn(f"  User should set public email in GitLab Profile, or set EMAIL_DOMAIN variable")
+                  except Exception as e:
+                      log_warn(f"Could not get user {user_id}: {e}")
+              elif group_id:
+                  # Group approvers - include all members of the group
+                  try:
+                      members = gl.get_group_members(group_id)
+                      log_info(f"Approver group {group_id} has {len(members)} members")
+                      for member in members:
+                          email = get_user_email(member, email_domain)
+                          if email and not is_excluded_email(email):
+                              approvers[email] = member.get('name', 'Unknown')
+                          elif not email:
+                              log_warn(f"Group member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get group {group_id} members: {e}")
+              elif access_level:
+                  # Role-based approvers (e.g., all maintainers)
+                  try:
+                      members = gl.get_project_members(project_id, min_access_level=access_level)
+                      log_info(f"Found {len(members)} project members with access_level >= {access_level}")
+                      for member in members:
+                          if member.get('access_level', 0) >= access_level:
+                              email = get_user_email(member, email_domain)
+                              if email and not is_excluded_email(email):
+                                  approvers[email] = member.get('name', 'Unknown')
+                              elif not email:
+                                  log_warn(f"Project member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get project members for access_level {access_level}: {e}")
+
+          return approvers
+
+      def send_email(smtp_host, smtp_port, from_addr, from_name, to_emails, subject, html, text):
+          msg = MIMEMultipart('alternative')
+          msg['Subject'] = subject
+          msg['From'] = formataddr((from_name, from_addr)) if from_name else from_addr
+          msg['To'] = ', '.join(to_emails)
+          msg.attach(MIMEText(text, 'plain'))
+          msg.attach(MIMEText(html, 'html'))
+
+          try:
+              with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                  server.sendmail(from_addr, to_emails, msg.as_string())
+              return True
+          except Exception as e:
+              log_error(f"SMTP error: {e}")
+              return False
+
+      def get_action_details(operation, subscription_id, subscription_name, scope_type, scope_id, subscription_state, allow_tracing, scope_display=None, display_name=None):
+          """Generate human-readable action description and changes list for each operation.
+
+          Args:
+              scope_display: Human-readable scope description (e.g., "Product: my-product")
+              display_name: Subscription display name (fetched from Azure for existing subscriptions)
+          """
+          action_title = ""
+          action_desc = ""
+          changes = []
+
+          # For existing subscriptions, use fetched display_name if available
+          sub_display = display_name or subscription_id
+
+          if operation == 'create_subscription':
+              action_title = "Create New Subscription"
+              # Build scope description
+              if scope_type == 'product':
+                  scope_desc = f"Product: {scope_id}"
+              elif scope_type == 'api':
+                  scope_desc = f"API: {scope_id}"
+              else:
+                  scope_desc = "All APIs (service-level access)"
+
+              action_desc = f"A new APIM subscription will be created with access to {scope_desc}."
+              changes = [
+                  f"Create subscription: <b>{subscription_name}</b>",
+                  f"Scope: {scope_desc}",
+                  f"Initial state: {subscription_state}",
+                  f"Tracing enabled: {allow_tracing}",
+                  "Primary and secondary API keys will be generated"
+              ]
+
+          elif operation == 'delete_subscription':
+              action_title = "Delete Subscription"
+              action_desc = f"The subscription <code>{sub_display}</code> will be permanently deleted."
+              changes = [
+                  f"Delete subscription: <b>{sub_display}</b>",
+                  f"Subscription ID: <code>{subscription_id}</code>"
+              ]
+              if scope_display:
+                  changes.append(f"Scope: {scope_display}")
+              changes.extend([
+                  "All API keys for this subscription will be invalidated",
+                  "Applications using this subscription will lose access immediately",
+                  "<b>This action cannot be undone</b>"
+              ])
+
+          elif operation == 'get_subscription_keys':
+              action_title = "Retrieve Subscription Keys"
+              action_desc = f"The primary and secondary API keys for subscription <code>{sub_display}</code> will be displayed."
+              changes = [
+                  f"Retrieve keys for: <b>{sub_display}</b>",
+                  f"Subscription ID: <code>{subscription_id}</code>"
+              ]
+              if scope_display:
+                  changes.append(f"Scope: {scope_display}")
+              changes.extend([
+                  "Keys will be emailed securely to requestor",
+                  "<b>Keys are sensitive data - ensure secure handling</b>"
+              ])
+
+          elif operation == 'regenerate_primary_key':
+              action_title = "Regenerate Primary Key"
+              action_desc = f"The primary API key for subscription <code>{sub_display}</code> will be regenerated."
+              changes = [
+                  f"Regenerate primary key for: <b>{sub_display}</b>",
+                  f"Subscription ID: <code>{subscription_id}</code>"
+              ]
+              if scope_display:
+                  changes.append(f"Scope: {scope_display}")
+              changes.extend([
+                  "Current primary key will be invalidated immediately",
+                  "Applications using the primary key will lose access",
+                  "A new primary key will be generated",
+                  "<b>This action cannot be undone</b>"
+              ])
+
+          elif operation == 'regenerate_secondary_key':
+              action_title = "Regenerate Secondary Key"
+              action_desc = f"The secondary API key for subscription <code>{sub_display}</code> will be regenerated."
+              changes = [
+                  f"Regenerate secondary key for: <b>{sub_display}</b>",
+                  f"Subscription ID: <code>{subscription_id}</code>"
+              ]
+              if scope_display:
+                  changes.append(f"Scope: {scope_display}")
+              changes.extend([
+                  "Current secondary key will be invalidated immediately",
+                  "Applications using the secondary key will lose access",
+                  "A new secondary key will be generated",
+                  "<b>This action cannot be undone</b>"
+              ])
+
+          elif operation == 'regenerate_both_keys':
+              action_title = "Regenerate Both Keys"
+              action_desc = f"Both primary and secondary API keys for subscription <code>{sub_display}</code> will be regenerated."
+              changes = [
+                  f"Regenerate ALL keys for: <b>{sub_display}</b>",
+                  f"Subscription ID: <code>{subscription_id}</code>"
+              ]
+              if scope_display:
+                  changes.append(f"Scope: {scope_display}")
+              changes.extend([
+                  "Current primary key will be invalidated immediately",
+                  "Current secondary key will be invalidated immediately",
+                  "ALL applications using this subscription will lose access",
+                  "New primary and secondary keys will be generated",
+                  "<b>This action cannot be undone</b>"
+              ])
+
+          return action_title, action_desc, changes
+
+      def get_fallback_approvers():
+          """Get approvers from APPROVER_EMAILS environment variable."""
+          approver_emails = os.environ.get('APPROVER_EMAILS', '')
+          if not approver_emails:
+              return {}
+          approvers = {}
+          for email in approver_emails.split(','):
+              email = email.strip()
+              if email:
+                  # Use email prefix as name if no name provided
+                  name = email.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+                  approvers[email] = name
+          return approvers
+
+      def main():
+          gitlab_url = os.environ.get('GITLAB_URL') or os.environ.get('CI_SERVER_URL')
+          gitlab_token = os.environ.get('GITLAB_TOKEN')
+          smtp_host = os.environ.get('SMTP_HOST')
+          smtp_from = os.environ.get('SMTP_FROM')
+          smtp_from_name = os.environ.get('SMTP_FROM_NAME', '')
+          smtp_port = int(os.environ.get('SMTP_PORT', '25'))
+          approver_emails_fallback = os.environ.get('APPROVER_EMAILS', '')
+
+          # Check minimum requirements
+          if not smtp_host or not smtp_from:
+              log_warn("Missing SMTP_HOST or SMTP_FROM - skipping notification")
+              return
+
+          if not gitlab_token and not approver_emails_fallback:
+              log_warn("Missing both GITLAB_TOKEN and APPROVER_EMAILS - skipping notification")
+              log_warn("Set GITLAB_TOKEN (with read_api scope, Maintainer access) or APPROVER_EMAILS")
+              return
+
+          project_id = os.environ.get('CI_PROJECT_ID')
+          branch = os.environ.get('CI_COMMIT_BRANCH', 'main')
+          env_name = get_env_from_branch(branch)
+
+          approvers = {}
+
+          # EMAIL_DOMAIN allows constructing email from username (default: lazard.com)
+          email_domain = os.environ.get('EMAIL_DOMAIN', 'lazard.com')
+          log_info(f"Email domain: {email_domain} (emails constructed as username@{email_domain})")
+
+          # Try to get approvers from GitLab API first
+          if gitlab_token and gitlab_url:
+              log_info(f"Collecting approvers for environment: {env_name}")
+              gl = GitLabClient(gitlab_url, gitlab_token)
+              approvers = collect_approvers(gl, project_id, env_name, email_domain or None)
+
+          # Fallback to APPROVER_EMAILS if API failed or returned no approvers
+          if not approvers and approver_emails_fallback:
+              log_info("Using APPROVER_EMAILS fallback")
+              approvers = get_fallback_approvers()
+
+          if not approvers:
+              log_warn("No approvers found - skipping notification")
+              log_warn("Either fix GITLAB_TOKEN permissions or set APPROVER_EMAILS variable")
+              return
+
+          log_info(f"Found {len(approvers)} approvers")
+
+          # Build context
+          operation = os.environ.get('OPERATION', 'Unknown')
+          pipeline_url = os.environ.get('CI_PIPELINE_URL', '')
+          project_name = os.environ.get('CI_PROJECT_NAME', 'APIM')
+          triggered_by = os.environ.get('GITLAB_USER_NAME', 'Unknown')
+          subscription_id = os.environ.get('SUBSCRIPTION_ID', '')
+          subscription_name = os.environ.get('SUBSCRIPTION_NAME', '')
+          scope_type = os.environ.get('SCOPE_TYPE', '')
+          scope_id = os.environ.get('SCOPE_ID', '')
+          subscription_state = os.environ.get('SUBSCRIPTION_STATE', 'active')
+          allow_tracing = os.environ.get('ALLOW_TRACING', 'false')
+          lob = os.environ.get('CI_PROJECT_ROOT_NAMESPACE', 'Unknown')
+          apim_instance = os.environ.get('APIM_SERVICE', 'Unknown')
+
+          # For non-create operations, fetch subscription details from Azure to get scope/product info
+          scope_display = None
+          display_name = None
+
+          if subscription_id and operation != 'create_subscription':
+              az_tenant_id = os.environ.get('AZ_TENANT_ID', '')
+              az_client_id = os.environ.get('AZ_SPN_CLIENT_ID', '')
+              az_client_secret = os.environ.get('AZ_SPN_CLIENT_SECRET', '')
+              az_subscription_id = os.environ.get('AZ_SUBSCRIPTION_ID', '')
+              resource_group = os.environ.get('RESOURCE_GROUP', '')
+
+              if az_tenant_id and az_client_id and az_client_secret and az_subscription_id and resource_group and apim_instance:
+                  log_info(f"Fetching subscription details for: {subscription_id}")
+                  azure = AzureClient(az_tenant_id, az_client_id, az_client_secret)
+                  sub_details = azure.get_subscription_details(
+                      az_subscription_id, resource_group, apim_instance, subscription_id
+                  )
+
+                  if sub_details:
+                      props = sub_details.get('properties', {})
+                      display_name = props.get('displayName')
+                      scope_path = props.get('scope', '')
+
+                      if scope_path:
+                          _, _, scope_display = parse_scope(scope_path)
+                          if scope_display:
+                              log_info(f"Subscription scope: {scope_display}")
+
+                      if display_name:
+                          log_info(f"Subscription display name: {display_name}")
+                  else:
+                      log_warn("Could not fetch subscription details - scope info will not be included in email")
+              else:
+                  log_warn("Azure credentials not fully configured - scope info will not be included in email")
+
+          # Timestamp in Eastern Time (New York)
+          eastern = timezone(timedelta(hours=-5))  # EST (adjust for DST if needed)
+          now_eastern = datetime.now(eastern)
+          timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+          # Risk indicator for destructive/sensitive operations
+          destructive_ops = ['delete_subscription', 'regenerate_primary_key', 'regenerate_secondary_key', 'regenerate_both_keys']
+          sensitive_ops = ['get_subscription_keys']
+          is_destructive = operation in destructive_ops
+          is_sensitive = operation in sensitive_ops
+
+          # Get action details
+          action_title, action_desc, changes = get_action_details(
+              operation, subscription_id, subscription_name,
+              scope_type, scope_id, subscription_state, allow_tracing,
+              scope_display=scope_display, display_name=display_name
+          )
+
+          env_color = {'prd': '#dc3545', 'stg': '#fd7e14', 'tst': '#17a2b8', 'dev': '#28a745'}.get(env_name, '#6c757d')
+
+          risk_banner = ''
+          if is_destructive:
+              risk_banner = '''<div style="background: #dc3545; color: white; padding: 12px 20px; margin-bottom: 15px; border-radius: 4px;">
+              <strong>DESTRUCTIVE OPERATION</strong> - This action will permanently delete or invalidate resources. Please review carefully.
+              </div>'''
+          elif is_sensitive:
+              risk_banner = '''<div style="background: #fd7e14; color: white; padding: 12px 20px; margin-bottom: 15px; border-radius: 4px;">
+              <strong>SENSITIVE DATA ACCESS</strong> - This operation will expose API subscription keys. Ensure you are authorized to view this data.
+              </div>'''
+
+          # Build changes list HTML
+          changes_html = ""
+          if changes:
+              changes_items = "".join([f"<li>{c}</li>" for c in changes])
+              changes_html = f'''
+              <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid {'#dc3545' if is_destructive else '#fd7e14' if is_sensitive else '#1f75cb'};">
+                  <h3 style="margin-top: 0; color: #333;">Requested Action: {action_title}</h3>
+                  <p style="color: #666;">{action_desc}</p>
+                  <h4 style="color: #333; margin-bottom: 8px;">What will happen:</h4>
+                  <ul style="margin: 0; padding-left: 20px; color: #333;">
+                      {changes_items}
+                  </ul>
+              </div>'''
+
+          html = f'''<!DOCTYPE html><html><head><style>
+          body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 0; }}
+          .header {{ background: #1f75cb; color: white; padding: 20px; }}
+          .header h2 {{ margin: 0 0 5px 0; }}
+          .content {{ padding: 20px; background: #f5f5f5; }}
+          .details {{ background: white; padding: 15px; margin: 15px 0; border-radius: 4px; }}
+          .details table {{ width: 100%; border-collapse: collapse; }}
+          .details td {{ padding: 8px 10px; border-bottom: 1px solid #eee; }}
+          .details tr:last-child td {{ border-bottom: none; }}
+          .btn {{ background: #1f75cb; color: white; padding: 12px 24px; text-decoration: none; display: inline-block; border-radius: 4px; font-weight: bold; }}
+          .env {{ background: {env_color}; color: white; padding: 3px 10px; font-size: 12px; border-radius: 3px; font-weight: bold; }}
+          .lob {{ background: #6f42c1; color: white; padding: 3px 10px; font-size: 12px; border-radius: 3px; }}
+          .risk {{ background: #dc3545; color: white; padding: 2px 8px; font-size: 11px; border-radius: 3px; margin-left: 8px; }}
+          .sensitive {{ background: #fd7e14; color: white; padding: 2px 8px; font-size: 11px; border-radius: 3px; margin-left: 8px; }}
+          .timestamp {{ color: rgba(255,255,255,0.8); font-size: 13px; }}
+          code {{ background: #e9ecef; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
+          </style></head><body>
+          <div class="header">
+              <h2>Pipeline Approval Required</h2>
+              <span class="timestamp">Requested: {timestamp}</span>
+          </div>
+          <div class="content">
+              {risk_banner}
+              <p>A pipeline needs your approval to deploy to <span class="env">{env_name.upper()}</span></p>
+
+              {changes_html}
+
+              <div class="details">
+                  <table>
+                      <tr><td style="width: 140px;"><b>LOB:</b></td><td><span class="lob">{lob.upper()}</span></td></tr>
+                      <tr><td><b>APIM Instance:</b></td><td><code>{apim_instance}</code></td></tr>
+                      <tr><td><b>Environment:</b></td><td><span class="env">{env_name.upper()}</span></td></tr>
+                      <tr><td><b>Triggered by:</b></td><td>{triggered_by}</td></tr>
+                      <tr><td><b>Project:</b></td><td>{project_name}</td></tr>
+                  </table>
+              </div>
+              <p style="margin-top: 20px;">
+                  <a href="{pipeline_url}" class="btn">Review & Approve Pipeline</a>
+              </p>
+          </div>
+          </body></html>'''
+
+          # Plain text version
+          changes_text = "\n".join([f"  - {c.replace('<b>', '').replace('</b>', '')}" for c in changes])
+          separator_long = "=" * 50
+          separator_short = "-" * 30
+          destructive_warning = "!! DESTRUCTIVE OPERATION !!" if is_destructive else ""
+          sensitive_warning = "!! SENSITIVE DATA ACCESS !!" if is_sensitive else ""
+          action_desc_plain = action_desc.replace('<code>', '').replace('</code>', '')
+
+          text_lines = [
+              "PIPELINE APPROVAL REQUIRED",
+              separator_long,
+              "",
+              destructive_warning,
+              sensitive_warning,
+              "",
+              f"REQUESTED ACTION: {action_title}",
+              separator_short,
+              action_desc_plain,
+              "",
+              "WHAT WILL HAPPEN:",
+              changes_text,
+              "",
+              "DETAILS:",
+              separator_short,
+              f"LOB:           {lob.upper()}",
+              f"APIM Instance: {apim_instance}",
+              f"Environment:   {env_name.upper()}",
+              f"Triggered by:  {triggered_by}",
+              f"Project:       {project_name}",
+              f"Requested at:  {timestamp}",
+              "",
+              "REVIEW & APPROVE:",
+              pipeline_url
+          ]
+          text = "\n".join(text_lines)
+
+          lob_prefix = f"[{lob.upper()}]" if lob and lob != 'Unknown' else "[APIM]"
+          env_label = "PRODUCTION" if env_name == 'prd' else env_name.upper()
+          subject = f"{lob_prefix} [{env_label}] Approval Required: {action_title}"
+
+          if send_email(smtp_host, smtp_port, smtp_from, smtp_from_name, list(approvers.keys()), subject, html, text):
+              log_info("Notification emails sent successfully")
+              for email, name in approvers.items():
+                  log_info(f"  - {name} <{email}>")
+          else:
+              log_error("Failed to send notification emails")
+
+      if __name__ == '__main__':
+          main()
+      PYTHON_SCRIPT
+
+      python /tmp/notify_approvers.py
+  allow_failure: true  # Don't block pipeline if notification fails
+
+# ============================================
+# Deploy Base Template
+# ============================================
+.deploy_base:
+  stage: deploy
+  image: $IMAGE_AZURE_CLI
+  timeout: 15 minutes
+  before_script:
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+    - *fetch_and_send_keys
+  artifacts:
+    paths:
+      - audit-*.json
+    expire_in: 30 days
+
+# ============================================
+# Script Templates
+# ============================================
+.create_subscription:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Creating Subscription"
+      log_info "=========================================="
+
+      # Generate subscription ID from display name
+      SUBSCRIPTION_ID="$(echo "$SUBSCRIPTION_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')-$(date +%m%d%Y%H%M)"
+
+      log_info "Generated subscription ID: $SUBSCRIPTION_ID"
+      log_info "Display Name: $SUBSCRIPTION_NAME"
+      log_info "Scope Type: $SCOPE_TYPE"
+
+      # Build scope based on type
+      case "$SCOPE_TYPE" in
+        product)
+          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/products/${SCOPE_ID}"
+          log_info "Scope: Product - $SCOPE_ID"
+          ;;
+        api)
+          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/apis/${SCOPE_ID}"
+          log_info "Scope: API - $SCOPE_ID"
+          ;;
+        all_apis)
+          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/apis"
+          log_info "Scope: All APIs (service-level)"
+          ;;
+        *)
+          log_error "Invalid SCOPE_TYPE: $SCOPE_TYPE"
+          exit 1
+          ;;
+      esac
+
+      SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
+
+      REQUEST_BODY=$(jq -n \
+        --arg displayName "$SUBSCRIPTION_NAME" \
+        --arg scope "$SCOPE" \
+        --arg state "$SUBSCRIPTION_STATE" \
+        --argjson allowTracing "$( [ "$ALLOW_TRACING" = "true" ] && echo "true" || echo "false" )" \
+        '{
+          "properties": {
+            "displayName": $displayName,
+            "scope": $scope,
+            "state": $state,
+            "allowTracing": $allowTracing
+          }
+        }')
+
+      log_debug "Creating subscription at: $SUBSCRIPTION_URL"
+      log_debug "Request body: $REQUEST_BODY"
+      CREATE_OUTPUT=$(az rest --method PUT \
+        --url "$SUBSCRIPTION_URL" \
+        --headers "Content-Type=application/json" \
+        --body "$REQUEST_BODY" \
+        --output json 2>&1)
+      CREATE_EXIT_CODE=$?
+
+      if [ $CREATE_EXIT_CODE -eq 0 ] && echo "$CREATE_OUTPUT" | jq -e '.name' > /dev/null 2>&1; then
+        log_ok "Subscription created successfully"
+        log_audit "create_subscription" "$SUBSCRIPTION_ID" "name=$SUBSCRIPTION_NAME,scope_type=$SCOPE_TYPE,scope_id=${SCOPE_ID:-all_apis}"
+        echo ""
+        echo "Subscription Details:"
+        echo "$CREATE_OUTPUT" | jq '{
+          id: .name,
+          displayName: .properties.displayName,
+          scope: .properties.scope,
+          state: .properties.state,
+          createdDate: .properties.createdDate
+        }'
+        echo ""
+
+        # Auto-send keys if enabled
+        if [ "$AUTO_SEND_KEYS" = "true" ]; then
+          log_info "AUTO_SEND_KEYS=true - automatically sending subscription keys"
+          export SUBSCRIPTION_ID
+          fetch_and_send_keys "$SUBSCRIPTION_ID" "created"
+        else
+          echo "NOTE: Use 'get_subscription_keys' operation to retrieve the subscription keys."
+          echo "TIP: Set AUTO_SEND_KEYS=true to automatically receive keys after creation."
+        fi
+      else
+        log_error "Failed to create subscription"
+        log_error "Error: $CREATE_OUTPUT"
+        exit 1
+      fi
+
+.delete_subscription:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Deleting Subscription: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Deleting subscription at: $SUBSCRIPTION_URL"
+      DELETE_OUTPUT=$(az rest --method DELETE \
+        --url "$SUBSCRIPTION_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1)
+      DELETE_EXIT_CODE=$?
+
+      if [ $DELETE_EXIT_CODE -eq 0 ]; then
+        log_ok "Subscription deleted"
+        log_audit "delete_subscription" "$SUBSCRIPTION_ID" "status=deleted"
+      else
+        # Check if the error is "subscription not found" which is acceptable
+        if echo "$DELETE_OUTPUT" | grep -qi "not found\|does not exist"; then
+          log_warn "Subscription not found (already deleted)"
+          log_audit "delete_subscription" "$SUBSCRIPTION_ID" "status=not_found"
+        else
+          log_error "Failed to delete subscription"
+          log_error "Error: $DELETE_OUTPUT"
+          exit 1
+        fi
+      fi
+
+.get_subscription_keys:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Retrieving Subscription Keys: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      SECRETS_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/listSecrets?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Fetching secrets from: $SECRETS_URL"
+      HTTP_RESPONSE=$(az rest --method POST \
+        --url "$SECRETS_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+
+      if ! echo "$HTTP_RESPONSE" | jq -e '.primaryKey' > /dev/null 2>&1; then
+        log_error "Failed to retrieve subscription keys"
+        log_error "Error: $HTTP_RESPONSE"
+        exit 1
+      fi
+
+      log_ok "Subscription keys retrieved successfully"
+      log_audit "get_subscription_keys" "$SUBSCRIPTION_ID" "status=keys_retrieved"
+
+      PRIMARY_KEY=$(echo "$HTTP_RESPONSE" | jq -r '.primaryKey')
+      SECONDARY_KEY=$(echo "$HTTP_RESPONSE" | jq -r '.secondaryKey')
+
+      # Check if we should send via email or display in logs
+      if [ "$SEND_KEYS_VIA_EMAIL" = "true" ]; then
+        log_info "SEND_KEYS_VIA_EMAIL=true - sending keys via secure email"
+
+        # Determine recipient email (default EMAIL_DOMAIN to lazard.com)
+        EMAIL_DOMAIN="${EMAIL_DOMAIN:-lazard.com}"
+        RECIPIENT_EMAIL="${GITLAB_USER_EMAIL:-}"
+        if [ -z "$RECIPIENT_EMAIL" ] && [ -n "$GITLAB_USER_LOGIN" ]; then
+          RECIPIENT_EMAIL="${GITLAB_USER_LOGIN}@${EMAIL_DOMAIN}"
+        fi
+
+        if [ -z "$RECIPIENT_EMAIL" ]; then
+          log_error "Cannot send email: No recipient email available"
+          log_error "GITLAB_USER_LOGIN not available"
+          log_warn "Falling back to displaying keys in logs..."
+          SEND_KEYS_VIA_EMAIL="false"
+        fi
+
+        if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_FROM" ]; then
+          log_error "Cannot send email: SMTP_HOST or SMTP_FROM not configured"
+          log_warn "Falling back to displaying keys in logs..."
+          SEND_KEYS_VIA_EMAIL="false"
+        fi
+      fi
+
+      if [ "$SEND_KEYS_VIA_EMAIL" = "true" ]; then
+        log_info "Sending keys to: $RECIPIENT_EMAIL"
+
+        # Export variables for Python script
+        export RECIPIENT_EMAIL
+        export PRIMARY_KEY
+        export SECONDARY_KEY
+
+        # Create and run email script
+        python3 << PYTHON_SCRIPT
+      import os
+      import smtplib
+      from email.mime.text import MIMEText
+      from email.mime.multipart import MIMEMultipart
+      from email.utils import formataddr
+      from datetime import datetime, timezone, timedelta
+
+      smtp_host = os.environ.get('SMTP_HOST')
+      smtp_from = os.environ.get('SMTP_FROM')
+      smtp_from_name = os.environ.get('SMTP_FROM_NAME', 'APIM Pipeline')
+      smtp_port = int(os.environ.get('SMTP_PORT', '25'))
+      recipient_email = os.environ.get('RECIPIENT_EMAIL')
+      recipient_name = os.environ.get('GITLAB_USER_NAME', 'User')
+
+      subscription_id = os.environ.get('SUBSCRIPTION_ID')
+      primary_key = os.environ.get('PRIMARY_KEY')
+      secondary_key = os.environ.get('SECONDARY_KEY')
+      apim_service = os.environ.get('APIM_SERVICE')
+      env_name = os.environ.get('ENV_NAME')
+      pipeline_url = os.environ.get('CI_PIPELINE_URL', '')
+
+      # Timestamp
+      eastern = timezone(timedelta(hours=-5))
+      now_eastern = datetime.now(eastern)
+      timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+      env_color = {'prd': '#dc3545', 'stg': '#fd7e14', 'tst': '#17a2b8', 'dev': '#28a745'}.get(env_name, '#6c757d')
+
+      html = f'''<!DOCTYPE html><html><head><style>
+      body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 0; }}
+      .header {{ background: #1f75cb; color: white; padding: 20px; }}
+      .content {{ padding: 20px; background: #f5f5f5; }}
+      .warning {{ background: #fff3cd; border: 1px solid #ffc107; padding: 15px; margin: 15px 0; border-radius: 4px; }}
+      .keys {{ background: white; padding: 20px; margin: 15px 0; border-radius: 4px; border: 1px solid #ddd; }}
+      .key-label {{ font-weight: bold; color: #333; margin-bottom: 5px; }}
+      .key-value {{ font-family: monospace; background: #f8f9fa; padding: 10px; border-radius: 4px; word-break: break-all; margin-bottom: 15px; border: 1px solid #e9ecef; }}
+      .env {{ background: {env_color}; color: white; padding: 3px 10px; font-size: 12px; border-radius: 3px; font-weight: bold; }}
+      .timestamp {{ color: rgba(255,255,255,0.8); font-size: 13px; }}
+      code {{ background: #e9ecef; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
+      </style></head><body>
+      <div class="header">
+          <h2>Subscription Keys Retrieved</h2>
+          <span class="timestamp">{timestamp}</span>
+      </div>
+      <div class="content">
+          <div class="warning">
+              <strong>Security Notice:</strong> These are sensitive API keys. Do not forward this email or share these keys with unauthorized parties.
+          </div>
+
+          <p>Your requested subscription keys for <span class="env">{env_name.upper()}</span> environment:</p>
+
+          <div class="keys">
+              <p><strong>APIM Service:</strong> <code>{apim_service}</code></p>
+              <p><strong>Subscription ID:</strong> <code>{subscription_id}</code></p>
+
+              <div class="key-label">Primary Key:</div>
+              <div class="key-value">{primary_key}</div>
+
+              <div class="key-label">Secondary Key:</div>
+              <div class="key-value">{secondary_key}</div>
+          </div>
+
+          <div class="warning">
+              <strong>Best Practices:</strong>
+              <ul style="margin: 10px 0 0 0; padding-left: 20px;">
+                  <li>Store keys in a secure secrets manager (e.g., Azure Key Vault)</li>
+                  <li>Never commit keys to source code</li>
+                  <li>Rotate keys regularly</li>
+                  <li>Use secondary key for zero-downtime rotation</li>
+              </ul>
+          </div>
+
+          <p style="color: #666; font-size: 12px; margin-top: 20px;">
+              Retrieved from pipeline: <a href="{pipeline_url}">{pipeline_url}</a>
+          </p>
+      </div>
+      </body></html>'''
+
+      text = f'''SUBSCRIPTION KEYS RETRIEVED
+      ==================================================
+
+      SECURITY NOTICE: These are sensitive API keys.
+      Do not share these keys with unauthorized parties.
+
+      Environment: {env_name.upper()}
+      APIM Service: {apim_service}
+      Subscription ID: {subscription_id}
+
+      PRIMARY KEY:
+      {primary_key}
+
+      SECONDARY KEY:
+      {secondary_key}
+
+      ==================================================
+      BEST PRACTICES:
+      - Store keys in a secure secrets manager
+      - Never commit keys to source code
+      - Rotate keys regularly
+
+      Retrieved: {timestamp}
+      Pipeline: {pipeline_url}
+      '''
+
+      msg = MIMEMultipart('alternative')
+      msg['Subject'] = f'[APIM] [{env_name.upper()}] Subscription Keys: {subscription_id}'
+      msg['From'] = formataddr((smtp_from_name, smtp_from))
+      msg['To'] = recipient_email
+      msg.attach(MIMEText(text, 'plain'))
+      msg.attach(MIMEText(html, 'html'))
+
+      try:
+          with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+              server.sendmail(smtp_from, [recipient_email], msg.as_string())
+          print(f"[OK] Keys sent to {recipient_email}")
+      except Exception as e:
+          print(f"[ERROR] Failed to send email: {e}")
+          exit(1)
+      PYTHON_SCRIPT
+
+        EMAIL_EXIT_CODE=$?
+        if [ $EMAIL_EXIT_CODE -eq 0 ]; then
+          log_ok "Subscription keys sent via email"
+          echo ""
+          echo "=========================================="
+          echo "  Keys sent to: $RECIPIENT_EMAIL"
+          echo "=========================================="
+          echo ""
+          echo "The subscription keys have been sent to your email."
+          echo "Keys are NOT displayed in this log for security."
+        else
+          log_error "Failed to send email - falling back to log output"
+          SEND_KEYS_VIA_EMAIL="false"
+        fi
+      fi
+
+      # Fallback: display in logs if email not sent
+      if [ "$SEND_KEYS_VIA_EMAIL" != "true" ]; then
+        echo ""
+        echo "=========================================="
+        echo "  SECURITY WARNING"
+        echo "=========================================="
+        echo "  The following output contains sensitive API keys."
+        echo "  - Do not share these keys"
+        echo "  - Do not store keys in code or logs"
+        echo "  - Rotate keys regularly"
+        echo "  - Use secondary key for zero-downtime rotation"
+        echo "=========================================="
+        echo ""
+        echo "Subscription Keys:"
+        echo "===================="
+        echo ""
+        echo "Primary Key:"
+        echo "$PRIMARY_KEY"
+        echo ""
+        echo "Secondary Key:"
+        echo "$SECONDARY_KEY"
+        echo ""
+        echo "===================="
+        echo ""
+        echo "TIP: Set SEND_KEYS_VIA_EMAIL=true to receive keys via email instead."
+      fi
+
+.regenerate_primary_key:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Regenerating PRIMARY Key: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      echo ""
+      echo "WARNING: The current primary key will be invalidated immediately!"
+      echo ""
+
+      REGEN_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/regeneratePrimaryKey?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Regenerating primary key at: $REGEN_URL"
+      REGEN_OUTPUT=$(az rest --method POST \
+        --url "$REGEN_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1)
+      REGEN_EXIT_CODE=$?
+
+      if [ $REGEN_EXIT_CODE -eq 0 ]; then
+        log_ok "Primary key regenerated successfully"
+        log_audit "regenerate_primary_key" "$SUBSCRIPTION_ID" "status=regenerated"
+        echo ""
+        echo "The primary key has been regenerated."
+
+        # Auto-send keys if enabled
+        if [ "$AUTO_SEND_KEYS" = "true" ]; then
+          log_info "AUTO_SEND_KEYS=true - automatically sending subscription keys"
+          fetch_and_send_keys "$SUBSCRIPTION_ID" "regenerated"
+        else
+          echo "Use 'get_subscription_keys' operation to retrieve the new key."
+          echo "TIP: Set AUTO_SEND_KEYS=true to automatically receive keys after regeneration."
+        fi
+      else
+        log_error "Failed to regenerate primary key"
+        log_error "Error: $REGEN_OUTPUT"
+        exit 1
+      fi
+
+.regenerate_secondary_key:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Regenerating SECONDARY Key: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      echo ""
+      echo "WARNING: The current secondary key will be invalidated immediately!"
+      echo ""
+
+      REGEN_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/regenerateSecondaryKey?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Regenerating secondary key at: $REGEN_URL"
+      REGEN_OUTPUT=$(az rest --method POST \
+        --url "$REGEN_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1)
+      REGEN_EXIT_CODE=$?
+
+      if [ $REGEN_EXIT_CODE -eq 0 ]; then
+        log_ok "Secondary key regenerated successfully"
+        log_audit "regenerate_secondary_key" "$SUBSCRIPTION_ID" "status=regenerated"
+        echo ""
+        echo "The secondary key has been regenerated."
+
+        # Auto-send keys if enabled
+        if [ "$AUTO_SEND_KEYS" = "true" ]; then
+          log_info "AUTO_SEND_KEYS=true - automatically sending subscription keys"
+          fetch_and_send_keys "$SUBSCRIPTION_ID" "regenerated"
+        else
+          echo "Use 'get_subscription_keys' operation to retrieve the new key."
+          echo "TIP: Set AUTO_SEND_KEYS=true to automatically receive keys after regeneration."
+        fi
+      else
+        log_error "Failed to regenerate secondary key"
+        log_error "Error: $REGEN_OUTPUT"
+        exit 1
+      fi
+
+.regenerate_both_keys:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Regenerating BOTH Keys: $SUBSCRIPTION_ID"
+      log_info "=========================================="
+
+      echo ""
+      echo "WARNING: Both primary and secondary keys will be invalidated immediately!"
+      echo ""
+
+      # Regenerate primary key
+      log_info "Step 1/2: Regenerating primary key..."
+      REGEN_PRIMARY_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/regeneratePrimaryKey?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Regenerating primary key at: $REGEN_PRIMARY_URL"
+      REGEN_OUTPUT=$(az rest --method POST \
+        --url "$REGEN_PRIMARY_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1)
+      REGEN_EXIT_CODE=$?
+
+      if [ $REGEN_EXIT_CODE -ne 0 ]; then
+        log_error "Failed to regenerate primary key"
+        log_error "Error: $REGEN_OUTPUT"
+        exit 1
+      fi
+      log_ok "Primary key regenerated"
+
+      # Regenerate secondary key
+      log_info "Step 2/2: Regenerating secondary key..."
+      REGEN_SECONDARY_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}/regenerateSecondaryKey?api-version=${AZURE_API_VERSION}"
+
+      log_debug "Regenerating secondary key at: $REGEN_SECONDARY_URL"
+      REGEN_OUTPUT=$(az rest --method POST \
+        --url "$REGEN_SECONDARY_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1)
+      REGEN_EXIT_CODE=$?
+
+      if [ $REGEN_EXIT_CODE -ne 0 ]; then
+        log_error "Failed to regenerate secondary key"
+        log_error "Error: $REGEN_OUTPUT"
+        exit 1
+      fi
+      log_ok "Secondary key regenerated"
+
+      log_ok "Both keys regenerated successfully"
+      log_audit "regenerate_both_keys" "$SUBSCRIPTION_ID" "status=both_keys_regenerated"
+      echo ""
+      echo "Both primary and secondary keys have been regenerated."
+
+      # Auto-send keys if enabled
+      if [ "$AUTO_SEND_KEYS" = "true" ]; then
+        log_info "AUTO_SEND_KEYS=true - automatically sending subscription keys"
+        fetch_and_send_keys "$SUBSCRIPTION_ID" "regenerated"
+      else
+        echo "Use 'get_subscription_keys' operation to retrieve the new keys."
+        echo "TIP: Set AUTO_SEND_KEYS=true to automatically receive keys after regeneration."
+      fi
+
+# ============================================
+# Deploy Jobs - Dev Environment
+# ============================================
+create_subscription_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
+      when: manual
+  script:
+    - !reference [.create_subscription, script]
+
+delete_subscription_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
+      when: manual
+  script:
+    - !reference [.delete_subscription, script]
+
+get_subscription_keys_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_subscription_keys"
+      when: manual
+  script:
+    - !reference [.get_subscription_keys, script]
+
+regenerate_primary_key_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_primary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_primary_key, script]
+
+regenerate_secondary_key_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_secondary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_secondary_key, script]
+
+regenerate_both_keys_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_both_keys"
+      when: manual
+  script:
+    - !reference [.regenerate_both_keys, script]
+
+# ============================================
+# Deploy Jobs - Test Environment
+# ============================================
+create_subscription_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
+      when: manual
+  script:
+    - !reference [.create_subscription, script]
+
+delete_subscription_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
+      when: manual
+  script:
+    - !reference [.delete_subscription, script]
+
+get_subscription_keys_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_subscription_keys"
+      when: manual
+  script:
+    - !reference [.get_subscription_keys, script]
+
+regenerate_primary_key_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_primary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_primary_key, script]
+
+regenerate_secondary_key_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_secondary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_secondary_key, script]
+
+regenerate_both_keys_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_both_keys"
+      when: manual
+  script:
+    - !reference [.regenerate_both_keys, script]
+
+# ============================================
+# Deploy Jobs - Staging Environment
+# ============================================
+create_subscription_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
+      when: manual
+  script:
+    - !reference [.create_subscription, script]
+
+delete_subscription_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
+      when: manual
+  script:
+    - !reference [.delete_subscription, script]
+
+get_subscription_keys_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_subscription_keys"
+      when: manual
+  script:
+    - !reference [.get_subscription_keys, script]
+
+regenerate_primary_key_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_primary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_primary_key, script]
+
+regenerate_secondary_key_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_secondary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_secondary_key, script]
+
+regenerate_both_keys_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_both_keys"
+      when: manual
+  script:
+    - !reference [.regenerate_both_keys, script]
+
+# ============================================
+# Deploy Jobs - Production Environment
+# ============================================
+create_subscription_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
+      when: manual
+  script:
+    - !reference [.create_subscription, script]
+
+delete_subscription_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
+      when: manual
+  script:
+    - !reference [.delete_subscription, script]
+
+get_subscription_keys_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_subscription_keys"
+      when: manual
+  script:
+    - !reference [.get_subscription_keys, script]
+
+regenerate_primary_key_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_primary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_primary_key, script]
+
+regenerate_secondary_key_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_secondary_key"
+      when: manual
+  script:
+    - !reference [.regenerate_secondary_key, script]
+
+regenerate_both_keys_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "regenerate_both_keys"
+      when: manual
+  script:
+    - !reference [.regenerate_both_keys, script]

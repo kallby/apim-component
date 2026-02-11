@@ -1,0 +1,2881 @@
+# ============================================
+# APIM API Management Component
+#
+# A reusable CI/CD component for managing APIs
+# and policies in Azure API Management.
+#
+# Usage:
+#   include:
+#     - component: $CI_SERVER_FQDN/devops/components/api-management/apim-api@1.0.0
+#
+# Then run the pipeline and fill in the variables in the UI.
+#
+# ============================================
+# Required CI/CD Variables (set in consuming project):
+#
+# Spec Repository:
+#   SPEC_REPO_URL        - GitLab repo URL for API specs
+#   SPEC_REPO_USERNAME   - Username for cloning
+#   SPEC_REPO_TOKEN      - Deploy token (masked)
+#
+# Policy Repository (for policy operations):
+#   POLICY_REPO_URL      - GitLab repo URL for policies
+#   POLICY_REPO_USERNAME - Username for cloning
+#   POLICY_REPO_TOKEN    - Deploy token (masked)
+#
+# Azure - Shared:
+#   AZ_TENANT_ID
+#
+# Azure - Per environment (DEV, TST, STG, PRD):
+#   {ENV}_AZ_SPN_CLIENT_ID
+#   {ENV}_AZ_SPN_CLIENT_SECRET
+#   {ENV}_AZ_SUBSCRIPTION_ID
+#   {ENV}_RESOURCE_GROUP
+#   {ENV}_APIM_SERVICE
+#   {ENV}_BACKEND_URL
+# ============================================
+
+spec:
+  inputs: {}
+
+---
+
+# ============================================
+# Pipeline Variables (shown in Run Pipeline UI)
+# ============================================
+variables:
+  # -----------------------------------------------
+  # Container Images (self-hosted in GitLab registry)
+  # Change these to point to your internal registry
+  # -----------------------------------------------
+  IMAGE_AZURE_CLI: "${CI_REGISTRY}/devops/images/azure-cli:latest"
+  IMAGE_PYTHON: "${CI_REGISTRY}/devops/images/python:3.11-slim"
+  IMAGE_ALPINE: "${CI_REGISTRY}/devops/images/alpine:latest"
+
+  # Internal variables
+  SPEC_CLONE_DIR: "api-specs"
+  POLICY_CLONE_DIR: "apim-policies"
+  AZURE_API_VERSION: "2022-08-01"
+  SPEC_REPO_BRANCH: "main"
+  POLICY_REPO_BRANCH: "main"
+
+  # -----------------------------------------------
+  # User-provided variables (shown in Run Pipeline UI)
+  # -----------------------------------------------
+  OPERATION:
+    value: "import_api"
+    description: "Operation to perform"
+    options:
+      # API operations
+      - "import_api"
+      # - "update_api"
+      - "delete_api"
+      - "list_apis"
+      # Policy operations (API-level and Operation-level)
+      - "list_operations"
+      - "get_api_policy"
+      - "set_api_policy"
+      - "clear_api_policy"
+      - "get_operation_policy"
+      - "set_operation_policy"
+      - "clear_operation_policy"
+
+  SPEC_FILE_PATH:
+    value: ""
+    description: "Required for import. Path to spec file (e.g., 'orders-api.json' or 'v1/orders.yaml')"
+
+  API_NAME:
+    value: ""
+    description: "Required for delete_api, list_operations, and policy operations. Not used for import_api."
+
+  SPEC_FORMAT:
+    value: "auto"
+    description: "Specification format (auto-detect or specify manually)"
+    options:
+      - "auto"
+      - "openapi-json"
+      - "openapi-yaml"
+      - "swagger-json"
+      - "swagger-yaml"
+      - "wadl-xml"
+      - "wsdl-xml"
+      - "graphql"
+
+  # -----------------------------------------------
+  # Policy Operation Variables
+  # -----------------------------------------------
+  OPERATION_ID:
+    value: ""
+    description: "Operation ID for operation-level policies (e.g., 'get-orders', 'create-order')"
+
+  POLICY_FILE_PATH:
+    value: ""
+    description: "Path to policy XML in policy repo (e.g., 'apis/orders-api/policy.xml')"
+
+# ============================================
+# Stages
+# ============================================
+stages:
+  - list
+  - validate
+  - backup
+  - plan
+  - notify
+  - deploy
+  - verify
+
+# ============================================
+# Logging Functions
+# ============================================
+.logging_functions: &logging_functions
+  - |
+    log_info()  { echo "[INFO]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_warn()  { echo "[WARN]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_error() { echo "[ERROR] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >&2; }
+    log_ok()    { echo "[OK]    $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+# ============================================
+# Audit Functions
+# ============================================
+.audit_functions: &audit_functions
+  - |
+    AUDIT_LOG_FILE="${CI_PROJECT_DIR}/audit-${CI_PIPELINE_ID}.json"
+
+    # Initialize audit log as empty JSON array if it doesn't exist
+    if [ ! -f "$AUDIT_LOG_FILE" ]; then
+      echo "[]" > "$AUDIT_LOG_FILE"
+    fi
+
+    log_audit() {
+      local action="$1"
+      local resource="$2"
+      local details="${3:-}"
+
+      local audit_entry=$(jq -n \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg pipeline_id "${CI_PIPELINE_ID}" \
+        --arg job_id "${CI_JOB_ID}" \
+        --arg job_name "${CI_JOB_NAME}" \
+        --arg triggered_by "${GITLAB_USER_LOGIN:-unknown}" \
+        --arg action "${action}" \
+        --arg resource "${resource}" \
+        --arg environment "${ENV_NAME:-unknown}" \
+        --arg apim_service "${APIM_SERVICE:-unknown}" \
+        --arg details "${details}" \
+        --arg branch "${CI_COMMIT_BRANCH}" \
+        --arg commit_sha "${CI_COMMIT_SHA}" \
+        '{
+          timestamp: $timestamp,
+          pipeline_id: $pipeline_id,
+          job_id: $job_id,
+          job_name: $job_name,
+          triggered_by: $triggered_by,
+          action: $action,
+          resource: $resource,
+          environment: $environment,
+          apim_service: $apim_service,
+          details: $details,
+          branch: $branch,
+          commit_sha: $commit_sha
+        }')
+
+      # Append entry to JSON array
+      jq --argjson entry "$audit_entry" '. += [$entry]' "$AUDIT_LOG_FILE" > "${AUDIT_LOG_FILE}.tmp" && mv "${AUDIT_LOG_FILE}.tmp" "$AUDIT_LOG_FILE"
+      log_info "AUDIT: action=$action resource=$resource"
+    }
+
+# ============================================
+# Set Environment Based on Branch
+# ============================================
+.set_environment: &set_environment
+  - |
+    case "$CI_COMMIT_BRANCH" in
+      dev|develop)
+        export ENV_NAME="dev"
+        export AZ_SPN_CLIENT_ID="$DEV_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$DEV_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$DEV_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$DEV_RESOURCE_GROUP"
+        export APIM_SERVICE="$DEV_APIM_SERVICE"
+        export BACKEND_URL="$DEV_BACKEND_URL"
+        ;;
+      tst|test)
+        export ENV_NAME="tst"
+        export AZ_SPN_CLIENT_ID="$TST_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$TST_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$TST_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$TST_RESOURCE_GROUP"
+        export APIM_SERVICE="$TST_APIM_SERVICE"
+        export BACKEND_URL="$TST_BACKEND_URL"
+        ;;
+      stg|staging)
+        export ENV_NAME="stg"
+        export AZ_SPN_CLIENT_ID="$STG_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$STG_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$STG_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$STG_RESOURCE_GROUP"
+        export APIM_SERVICE="$STG_APIM_SERVICE"
+        export BACKEND_URL="$STG_BACKEND_URL"
+        ;;
+      prd|main)
+        export ENV_NAME="prd"
+        export AZ_SPN_CLIENT_ID="$PRD_AZ_SPN_CLIENT_ID"
+        export AZ_SPN_CLIENT_SECRET="$PRD_AZ_SPN_CLIENT_SECRET"
+        export AZ_SUBSCRIPTION_ID="$PRD_AZ_SUBSCRIPTION_ID"
+        export RESOURCE_GROUP="$PRD_RESOURCE_GROUP"
+        export APIM_SERVICE="$PRD_APIM_SERVICE"
+        export BACKEND_URL="$PRD_BACKEND_URL"
+        ;;
+      *)
+        log_error "Unsupported branch: $CI_COMMIT_BRANCH"
+        log_error "Use: dev/develop, tst/test, stg/staging, or prd/main"
+        exit 1
+        ;;
+    esac
+    log_info "Environment: $ENV_NAME"
+    log_info "APIM Service: $APIM_SERVICE"
+
+# ============================================
+# Azure Login
+# ============================================
+.azure_login: &azure_login
+  - |
+    log_info "Logging into Azure..."
+    if [ -z "$AZ_SPN_CLIENT_ID" ] || [ -z "$AZ_SPN_CLIENT_SECRET" ] || [ -z "$AZ_TENANT_ID" ]; then
+      log_error "Missing Azure credentials for environment $ENV_NAME"
+      exit 1
+    fi
+
+    az login --service-principal \
+      --username "$AZ_SPN_CLIENT_ID" \
+      --password "$AZ_SPN_CLIENT_SECRET" \
+      --tenant "$AZ_TENANT_ID" \
+      --output none
+
+    az account set --subscription "$AZ_SUBSCRIPTION_ID"
+    log_ok "Azure login successful"
+
+# ============================================
+# Build API URLs
+# ============================================
+.build_api_urls: &build_api_urls
+  - |
+    export APIM_BASE_URL="https://management.azure.com/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}"
+    export APIS_URL="${APIM_BASE_URL}/apis?api-version=${AZURE_API_VERSION}"
+    log_info "APIM Base URL configured"
+
+# ============================================
+# Clone Spec Repository
+# ============================================
+.clone_spec_repo: &clone_spec_repo
+  - |
+    log_info "Cloning spec repository..."
+    set +x
+    if echo "$SPEC_REPO_URL" | grep -q "^https://"; then
+      AUTH_URL=$(echo "$SPEC_REPO_URL" | sed "s|https://|https://${SPEC_REPO_USERNAME}:${SPEC_REPO_TOKEN}@|")
+    else
+      AUTH_URL="https://${SPEC_REPO_USERNAME}:${SPEC_REPO_TOKEN}@${SPEC_REPO_URL}"
+    fi
+    rm -rf "$SPEC_CLONE_DIR"
+    if ! git clone --depth 1 --branch "$SPEC_REPO_BRANCH" "$AUTH_URL" "$SPEC_CLONE_DIR" 2>/dev/null; then
+      log_error "Failed to clone spec repository"
+      exit 1
+    fi
+    set -x
+    log_ok "Spec repository cloned successfully"
+
+# ============================================
+# Clone Policy Repository
+# ============================================
+.clone_policy_repo: &clone_policy_repo
+  - |
+    log_info "Cloning policy repository..."
+    set +x
+    if echo "$POLICY_REPO_URL" | grep -q "^https://"; then
+      AUTH_URL=$(echo "$POLICY_REPO_URL" | sed "s|https://|https://${POLICY_REPO_USERNAME}:${POLICY_REPO_TOKEN}@|")
+    else
+      AUTH_URL="https://${POLICY_REPO_USERNAME}:${POLICY_REPO_TOKEN}@${POLICY_REPO_URL}"
+    fi
+    rm -rf "$POLICY_CLONE_DIR"
+    if ! git clone --depth 1 --branch "$POLICY_REPO_BRANCH" "$AUTH_URL" "$POLICY_CLONE_DIR" 2>/dev/null; then
+      log_error "Failed to clone policy repository"
+      exit 1
+    fi
+    set -x
+    log_ok "Policy repository cloned successfully"
+
+# ============================================
+# Stage: List (read-only operations)
+# ============================================
+list_apis:
+  stage: list
+  image: $IMAGE_AZURE_CLI
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "list_apis"
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+  script:
+    - |
+      log_info "=========================================="
+      log_info "APIs in $APIM_SERVICE"
+      log_info "=========================================="
+
+      API_LIST=$(az apim api list \
+        --resource-group "$RESOURCE_GROUP" \
+        --service-name "$APIM_SERVICE" \
+        --output json 2>&1)
+
+      if echo "$API_LIST" | jq -e '.' > /dev/null 2>&1; then
+        echo ""
+        echo "ID | Display Name | Path"
+        echo "---|--------------|-----"
+        echo "$API_LIST" | jq -r '.[] | "\(.name) | \(.displayName) | \(.path)"'
+        echo ""
+        log_ok "Found $(echo "$API_LIST" | jq 'length') APIs"
+      else
+        log_error "Failed to list APIs"
+        echo "$API_LIST"
+        exit 1
+      fi
+
+list_operations:
+  stage: list
+  image: $IMAGE_AZURE_CLI
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "list_operations"
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Operations for API: $API_NAME"
+      log_info "=========================================="
+
+      if [ -z "$API_NAME" ]; then
+        log_error "API_NAME is required for list_operations"
+        exit 1
+      fi
+
+      OP_LIST=$(az apim api operation list \
+        --resource-group "$RESOURCE_GROUP" \
+        --service-name "$APIM_SERVICE" \
+        --api-id "$API_NAME" \
+        --output json 2>&1)
+
+      if echo "$OP_LIST" | jq -e '.' > /dev/null 2>&1; then
+        echo ""
+        echo "Operation ID | Method | Display Name | URL Template"
+        echo "-------------|--------|--------------|-------------"
+        echo "$OP_LIST" | jq -r '.[] | "\(.name) | \(.method) | \(.displayName) | \(.urlTemplate)"'
+        echo ""
+        log_ok "Found $(echo "$OP_LIST" | jq 'length') operations"
+      else
+        log_error "Failed to list operations"
+        echo "$OP_LIST"
+        exit 1
+      fi
+
+# ============================================
+# Stage: Validate
+# ============================================
+validate_inputs:
+  stage: validate
+  image: $IMAGE_ALPINE
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^(list_apis|list_specs|list_operations)$/
+  script:
+    - *logging_functions
+    - |
+      log_info "=========================================="
+      log_info "Validating Pipeline Inputs"
+      log_info "=========================================="
+      echo "Operation: $OPERATION"
+      echo "Spec File: $SPEC_FILE_PATH"
+      echo "API ID: $API_NAME"
+      echo "Branch: $CI_COMMIT_BRANCH"
+      echo ""
+
+      # Validate operation
+      case "$OPERATION" in
+        import_api|delete_api)
+          log_ok "Valid API operation: $OPERATION"
+          ;;
+        get_api_policy|set_api_policy|clear_api_policy|get_operation_policy|set_operation_policy|clear_operation_policy)
+          log_ok "Valid policy operation: $OPERATION"
+          ;;
+        *)
+          log_error "Invalid operation: $OPERATION"
+          exit 1
+          ;;
+      esac
+
+      # Validate required inputs per operation
+      case "$OPERATION" in
+        import_api)
+          if [ -z "$SPEC_FILE_PATH" ]; then
+            log_error "SPEC_FILE_PATH is required for import_api"
+            exit 1
+          fi
+          ;;
+        delete_api)
+          if [ -z "$API_NAME" ]; then
+            log_error "API_NAME is required for delete_api"
+            exit 1
+          fi
+          ;;
+        get_api_policy|clear_api_policy)
+          if [ -z "$API_NAME" ]; then
+            log_error "API_NAME is required for $OPERATION"
+            exit 1
+          fi
+          ;;
+        set_api_policy)
+          if [ -z "$API_NAME" ]; then
+            log_error "API_NAME is required for set_api_policy"
+            exit 1
+          fi
+          if [ -z "$POLICY_FILE_PATH" ]; then
+            log_error "POLICY_FILE_PATH is required for set_api_policy"
+            exit 1
+          fi
+          ;;
+        get_operation_policy|clear_operation_policy)
+          if [ -z "$API_NAME" ] || [ -z "$OPERATION_ID" ]; then
+            log_error "API_NAME and OPERATION_ID are required for $OPERATION"
+            exit 1
+          fi
+          ;;
+        set_operation_policy)
+          if [ -z "$API_NAME" ] || [ -z "$OPERATION_ID" ]; then
+            log_error "API_NAME and OPERATION_ID are required for set_operation_policy"
+            exit 1
+          fi
+          if [ -z "$POLICY_FILE_PATH" ]; then
+            log_error "POLICY_FILE_PATH is required for set_operation_policy"
+            exit 1
+          fi
+          ;;
+      esac
+
+      log_ok "All inputs validated successfully"
+
+validate_spec:
+  stage: validate
+  image: $IMAGE_ALPINE
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
+  before_script:
+    - apk add --no-cache git jq libxml2-utils curl
+    - curl -sL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+    - *logging_functions
+    - *clone_spec_repo
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Validating API Specification"
+      log_info "=========================================="
+
+      SPEC_PATH="${SPEC_CLONE_DIR}/${SPEC_FILE_PATH}"
+
+      if [ ! -f "$SPEC_PATH" ]; then
+        log_error "Spec file not found: $SPEC_PATH"
+        log_info "Available files in spec repo:"
+        find "$SPEC_CLONE_DIR" -type f -name "*.json" -o -name "*.yaml" -o -name "*.yml" | head -20
+        exit 1
+      fi
+
+      log_info "Spec file: $SPEC_PATH"
+
+      # Detect format
+      case "$SPEC_PATH" in
+        *.json) FORMAT="json" ;;
+        *.yaml|*.yml) FORMAT="yaml" ;;
+        *) FORMAT="unknown" ;;
+      esac
+
+      # Validate syntax
+      if [ "$FORMAT" = "json" ]; then
+        if jq empty "$SPEC_PATH" 2>/dev/null; then
+          log_ok "JSON syntax valid"
+        else
+          log_error "Invalid JSON syntax"
+          exit 1
+        fi
+      elif [ "$FORMAT" = "yaml" ]; then
+        if yq eval '.' "$SPEC_PATH" > /dev/null 2>&1; then
+          log_ok "YAML syntax valid"
+        else
+          log_error "Invalid YAML syntax"
+          exit 1
+        fi
+      fi
+
+      # ============================================
+      # Check Required APIM Fields
+      # ============================================
+      log_info ""
+      log_info "Checking APIM fields..."
+      log_info ""
+
+      VALIDATION_FAILED=false
+
+      # Extract fields from spec (using x-lzd-* custom attributes)
+      if [ "$FORMAT" = "json" ]; then
+        API_ID=$(jq -r '.["x-lzd-api-id"] // empty' "$SPEC_PATH")
+        API_PATH=$(jq -r '.["x-lzd-api-path"] // empty' "$SPEC_PATH")
+        TITLE=$(jq -r '.info.title // empty' "$SPEC_PATH")
+        SUBSCRIPTION_REQUIRED=$(jq -r '.["x-lzd-api-subscription-required"] // "true"' "$SPEC_PATH")
+        SUBSCRIPTION_KEY_HEADER=$(jq -r '.["x-lzd-api-subscription-key-header-name"] // empty' "$SPEC_PATH")
+        SUBSCRIPTION_KEY_QUERY=$(jq -r '.["x-lzd-api-subscription-key-query-param-name"] // empty' "$SPEC_PATH")
+      else
+        API_ID=$(yq eval '.["x-lzd-api-id"] // ""' "$SPEC_PATH")
+        API_PATH=$(yq eval '.["x-lzd-api-path"] // ""' "$SPEC_PATH")
+        TITLE=$(yq eval '.info.title // ""' "$SPEC_PATH")
+        SUBSCRIPTION_REQUIRED=$(yq eval '.["x-lzd-api-subscription-required"] // "true"' "$SPEC_PATH")
+        SUBSCRIPTION_KEY_HEADER=$(yq eval '.["x-lzd-api-subscription-key-header-name"] // ""' "$SPEC_PATH")
+        SUBSCRIPTION_KEY_QUERY=$(yq eval '.["x-lzd-api-subscription-key-query-param-name"] // ""' "$SPEC_PATH")
+      fi
+
+      # Check info.title (required for auto-generating API ID)
+      if [ -n "$TITLE" ]; then
+        log_ok "info.title: $TITLE"
+      else
+        log_error "info.title: MISSING"
+        VALIDATION_FAILED=true
+      fi
+
+      # Check x-lzd-api-path (required)
+      if [ -n "$API_PATH" ]; then
+        # Auto-lowercase path if needed (warn but don't fail)
+        API_PATH_LOWER=$(echo "$API_PATH" | tr '[:upper:]' '[:lower:]')
+        if [ "$API_PATH" = "$API_PATH_LOWER" ]; then
+          log_ok "x-lzd-api-path: $API_PATH"
+        else
+          log_warn "x-lzd-api-path: $API_PATH -> $API_PATH_LOWER (will be lowercased)"
+          API_PATH="$API_PATH_LOWER"
+        fi
+
+        # Check for common typo: vendor/ instead of vendors/
+        if echo "$API_PATH" | grep -q "^vendor/" && ! echo "$API_PATH" | grep -q "^vendors/"; then
+          log_error "x-lzd-api-path: invalid prefix 'vendor/' (must be 'vendors/' with an 's')"
+          VALIDATION_FAILED=true
+        fi
+      else
+        log_error "x-lzd-api-path: MISSING"
+        VALIDATION_FAILED=true
+      fi
+
+      # Check x-lzd-api-subscription-required (optional, defaults to true)
+      if [ "$SUBSCRIPTION_REQUIRED" = "true" ] || [ "$SUBSCRIPTION_REQUIRED" = "false" ]; then
+        log_ok "x-lzd-api-subscription-required: $SUBSCRIPTION_REQUIRED"
+      else
+        log_warn "x-lzd-api-subscription-required: invalid value '$SUBSCRIPTION_REQUIRED' (using default: true)"
+        SUBSCRIPTION_REQUIRED="true"
+      fi
+
+      # Check x-lzd-api-subscription-key-header-name (optional)
+      if [ -n "$SUBSCRIPTION_KEY_HEADER" ]; then
+        log_ok "x-lzd-api-subscription-key-header-name: $SUBSCRIPTION_KEY_HEADER"
+      else
+        log_info "x-lzd-api-subscription-key-header-name: not set (will use default: x-lzd-{namespace}-api-key)"
+      fi
+
+      # Check x-lzd-api-subscription-key-query-param-name (optional)
+      if [ -n "$SUBSCRIPTION_KEY_QUERY" ]; then
+        log_ok "x-lzd-api-subscription-key-query-param-name: $SUBSCRIPTION_KEY_QUERY"
+      else
+        log_info "x-lzd-api-subscription-key-query-param-name: not set (will use default: x-lzd-{namespace}-api-key)"
+      fi
+
+      # Detect vendor API and validate requirements
+      IS_VENDOR_API=false
+      if echo "$API_PATH" | grep -q "^vendors/"; then
+        IS_VENDOR_API=true
+        log_info ""
+        log_info "Vendor API detected (path starts with 'vendors/')"
+
+        # Vendor APIs MUST have title starting with "Vendor: " (case-insensitive check, auto-fix case)
+        if echo "$TITLE" | grep -iq "^vendor: "; then
+          # Auto-fix case if needed (e.g., "VeNDor: " -> "Vendor: ")
+          TITLE_PREFIX=$(echo "$TITLE" | sed 's/^\([Vv][Ee][Nn][Dd][Oo][Rr]: \).*/\1/')
+          if [ "$TITLE_PREFIX" != "Vendor: " ]; then
+            TITLE_FOR_ID=$(echo "$TITLE" | sed 's/^[Vv][Ee][Nn][Dd][Oo][Rr]: //')
+            TITLE="Vendor: $TITLE_FOR_ID"
+            log_warn "  Title case fixed: $TITLE_PREFIX -> Vendor: "
+          fi
+          log_ok "  Title format: valid (starts with 'Vendor: ')"
+          # Extract the part after "Vendor: " for API ID generation
+          TITLE_FOR_ID=$(echo "$TITLE" | sed 's/^Vendor: //')
+          GENERATED_API_ID="vendor-$(echo "$TITLE_FOR_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')"
+        elif echo "$TITLE" | grep -iq "^vendor[^:]"; then
+          # Title starts with "vendor" but missing colon
+          log_error "  Title format: INVALID (missing colon after 'Vendor')"
+          log_error "  Current: $TITLE"
+          log_error "  Expected: Vendor: <API Name>"
+          VALIDATION_FAILED=true
+        else
+          log_error "  Title format: INVALID (must start with 'Vendor: ')"
+          log_error "  Current: $TITLE"
+          log_error "  Expected: Vendor: <API Name>"
+          VALIDATION_FAILED=true
+        fi
+      else
+        log_info ""
+        log_info "Internal API detected"
+
+        # Check if title starts with "Vendor:" but path doesn't start with "vendors/"
+        if echo "$TITLE" | grep -iq "^vendor:"; then
+          log_error "  Title starts with 'Vendor:' but path doesn't start with 'vendors/'"
+          log_error "  Current path: $API_PATH"
+          log_error "  Expected path: vendors/<vendor-name>/..."
+          VALIDATION_FAILED=true
+        fi
+
+        # Generate API ID from full title for internal APIs
+        GENERATED_API_ID=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+      fi
+
+      # Show what API ID will be generated
+      if [ -n "$API_ID" ]; then
+        log_ok "x-lzd-api-id: $API_ID"
+      elif [ -n "$GENERATED_API_ID" ]; then
+        log_warn "x-lzd-api-id: not set (will be generated: $GENERATED_API_ID)"
+      fi
+
+      # Show helpful error message if validation failed
+      if [ "$VALIDATION_FAILED" = "true" ]; then
+        echo ""
+        echo "=========================================="
+        echo "  SPEC VALIDATION FAILED"
+        echo "=========================================="
+        echo ""
+        echo "  Your spec file has validation errors."
+        echo ""
+        [ -z "$TITLE" ] && echo '    - info.title: MISSING'
+        [ -z "$API_PATH" ] && echo '    - x-lzd-api-path: MISSING'
+        echo "$API_PATH" | grep -q "^vendor/" && ! echo "$API_PATH" | grep -q "^vendors/" && echo '    - x-lzd-api-path: use "vendors/" not "vendor/"'
+        echo ""
+        echo "  Internal API example:"
+        echo '    {'
+        echo '      "openapi": "3.0.0",'
+        echo '      "x-lzd-api-path": "orders",'
+        echo '      "info": { "title": "Orders API", ... }'
+        echo '    }'
+        echo ""
+        echo "  Vendor API example:"
+        echo '    {'
+        echo '      "openapi": "3.0.0",'
+        echo '      "x-lzd-api-path": "vendors/acme/orders",'
+        echo '      "info": { "title": "Vendor: Acme Orders API", ... }'
+        echo '    }'
+        echo ""
+        echo "  Note: x-lzd-api-id is optional (auto-generated from title)"
+        echo ""
+        echo "=========================================="
+        exit 1
+      fi
+
+      log_ok "Spec validation passed"
+
+validate_policy:
+  stage: validate
+  image: $IMAGE_ALPINE
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_api_policy|set_operation_policy)$/
+  before_script:
+    - apk add --no-cache git libxml2-utils
+    - *logging_functions
+    - *clone_policy_repo
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Validating Policy File"
+      log_info "=========================================="
+
+      POLICY_PATH="${POLICY_CLONE_DIR}/${POLICY_FILE_PATH}"
+
+      if [ ! -f "$POLICY_PATH" ]; then
+        log_error "Policy file not found: $POLICY_PATH"
+        log_info "Available policy files:"
+        find "$POLICY_CLONE_DIR" -type f -name "*.xml" | head -20
+        exit 1
+      fi
+
+      log_info "Policy file: $POLICY_PATH"
+      log_info ""
+      log_info "Skipping XML validation for APIM policy files."
+      log_info "Azure APIM policies contain custom expressions (e.g., @(...)) that are"
+      log_info "valid for APIM but fail standard XML validation."
+      log_info ""
+      log_info "The policy will be validated by Azure APIM when applied."
+      log_info ""
+      log_ok "Policy file exists and will be applied to APIM"
+
+# ============================================
+# Stage: Backup
+# ============================================
+backup_api:
+  stage: backup
+  image: $IMAGE_AZURE_CLI
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
+  before_script:
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Backing Up API: $API_NAME"
+      log_info "=========================================="
+
+      BACKUP_FILE="${CI_PROJECT_DIR}/backup-api-${API_NAME}-${ENV_NAME}-${CI_PIPELINE_ID}.json"
+      API_URL="${APIM_BASE_URL}/apis/${API_NAME}?api-version=${AZURE_API_VERSION}&export=true&format=openapi+json"
+
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$API_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1) || true
+
+      if echo "$HTTP_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+        echo "$HTTP_RESPONSE" > "$BACKUP_FILE"
+        log_ok "Backup saved to: $BACKUP_FILE"
+        log_audit "backup_api" "$API_NAME" "backup_file=$BACKUP_FILE"
+      else
+        log_warn "API not found or could not be backed up"
+        echo "{}" > "$BACKUP_FILE"
+      fi
+  artifacts:
+    paths:
+      - backup-api-*.json
+      - audit-*.json
+    expire_in: 90 days
+
+backup_policy:
+  stage: backup
+  image: $IMAGE_AZURE_CLI
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_api_policy|clear_api_policy|set_operation_policy|clear_operation_policy)$/
+  before_script:
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Backing Up Policy"
+      log_info "=========================================="
+
+      if [ -n "$OPERATION_ID" ]; then
+        POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/operations/${OPERATION_ID}/policies/policy?api-version=${AZURE_API_VERSION}"
+        BACKUP_FILE="${CI_PROJECT_DIR}/backup-policy-${API_NAME}-${OPERATION_ID}-${ENV_NAME}-${CI_PIPELINE_ID}.xml"
+      else
+        POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/policies/policy?api-version=${AZURE_API_VERSION}"
+        BACKUP_FILE="${CI_PROJECT_DIR}/backup-policy-${API_NAME}-${ENV_NAME}-${CI_PIPELINE_ID}.xml"
+      fi
+
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1) || true
+
+      if echo "$HTTP_RESPONSE" | jq -e '.properties.value' > /dev/null 2>&1; then
+        echo "$HTTP_RESPONSE" | jq -r '.properties.value' > "$BACKUP_FILE"
+        log_ok "Backup saved to: $BACKUP_FILE"
+        log_audit "backup_policy" "$API_NAME" "backup_file=$BACKUP_FILE"
+      else
+        log_warn "No existing policy to backup"
+        echo "<!-- No policy configured -->" > "$BACKUP_FILE"
+      fi
+  artifacts:
+    paths:
+      - backup-policy-*.xml
+      - audit-*.json
+    expire_in: 90 days
+
+# ============================================
+# Stage: Plan
+# ============================================
+plan:
+  stage: plan
+  image: $IMAGE_AZURE_CLI
+  needs:
+    - job: validate_inputs
+      optional: true
+    - job: validate_spec
+      optional: true
+    - job: validate_policy
+      optional: true
+    - job: backup_api
+      optional: true
+    - job: backup_policy
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^(list_apis|list_specs|list_operations)$/
+  before_script:
+    - tdnf install -y git jq
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Execution Plan"
+      log_info "=========================================="
+      echo ""
+      echo "Operation:    $OPERATION"
+      echo "Environment:  $ENV_NAME"
+      echo "APIM Service: $APIM_SERVICE"
+      echo ""
+
+      case "$OPERATION" in
+        import_api)
+          echo "Action: Import new API from spec file"
+          echo "Spec File: $SPEC_FILE_PATH"
+          echo ""
+          echo "Note: Vendor APIs are auto-detected when x-lzd-api-path starts with 'vendors/'"
+          ;;
+        delete_api)
+          echo "Action: DELETE API (DESTRUCTIVE)"
+          echo "API ID: $API_NAME"
+          echo ""
+          echo "WARNING: This will permanently delete the API!"
+          ;;
+        get_api_policy)
+          echo "Action: Retrieve API policy (read-only)"
+          echo "API ID: $API_NAME"
+          ;;
+        set_api_policy)
+          echo "Action: Apply API policy"
+          echo "API ID: $API_NAME"
+          echo "Policy File: $POLICY_FILE_PATH"
+          ;;
+        clear_api_policy)
+          echo "Action: Remove API policy"
+          echo "API ID: $API_NAME"
+          ;;
+        get_operation_policy)
+          echo "Action: Retrieve operation policy (read-only)"
+          echo "API ID: $API_NAME"
+          echo "Operation ID: $OPERATION_ID"
+          ;;
+        set_operation_policy)
+          echo "Action: Apply operation policy"
+          echo "API ID: $API_NAME"
+          echo "Operation ID: $OPERATION_ID"
+          echo "Policy File: $POLICY_FILE_PATH"
+          ;;
+        clear_operation_policy)
+          echo "Action: Remove operation policy"
+          echo "API ID: $API_NAME"
+          echo "Operation ID: $OPERATION_ID"
+          ;;
+      esac
+
+      echo ""
+      log_info "Plan complete. Approve deploy job to execute."
+
+# ============================================
+# Stage: Notify (send approval notification emails)
+# ============================================
+notify_approvers:
+  stage: notify
+  image: $IMAGE_PYTHON
+  needs: ["plan"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(import_api|delete_api|set_api_policy|clear_api_policy|set_operation_policy|clear_operation_policy)$/
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  cache:
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install --quiet requests
+    # Set APIM_SERVICE based on branch (for email notification)
+    - |
+      case "$CI_COMMIT_BRANCH" in
+        dev|develop) export APIM_SERVICE="$DEV_APIM_SERVICE" ;;
+        tst|test) export APIM_SERVICE="$TST_APIM_SERVICE" ;;
+        stg|staging) export APIM_SERVICE="$STG_APIM_SERVICE" ;;
+        prd|main) export APIM_SERVICE="$PRD_APIM_SERVICE" ;;
+      esac
+  script:
+    - |
+      cat > /tmp/notify_approvers.py << 'PYTHON_SCRIPT'
+      #!/usr/bin/env python3
+      """Send approval notification emails to protected environment approvers."""
+
+      import os
+      import sys
+      import smtplib
+      from email.mime.text import MIMEText
+      from email.mime.multipart import MIMEMultipart
+      from email.utils import formataddr
+      from datetime import datetime, timezone, timedelta
+
+      try:
+          import requests
+      except ImportError:
+          print("[ERROR] requests library not installed")
+          sys.exit(1)
+
+      def log_info(msg): print(f"[INFO]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_warn(msg): print(f"[WARN]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_error(msg): print(f"[ERROR] {datetime.utcnow().isoformat()}Z - {msg}", file=sys.stderr)
+
+      class GitLabClient:
+          def __init__(self, url, token):
+              self.api_url = f"{url.rstrip('/')}/api/v4"
+              self.headers = {'PRIVATE-TOKEN': token}
+
+          def get(self, endpoint):
+              r = requests.get(f"{self.api_url}/{endpoint}", headers=self.headers, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          def get_protected_env(self, project_id, env_name):
+              return self.get(f"projects/{project_id}/protected_environments/{env_name}")
+
+          def get_user(self, user_id):
+              return self.get(f"users/{user_id}")
+
+          def get_group_members(self, group_id):
+              members = []
+              page = 1
+              while True:
+                  result = self.get(f"groups/{group_id}/members/all?page={page}&per_page=100")
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+              return members
+
+          def get_project_members(self, project_id, min_access_level=None):
+              """Get project members, optionally filtered by minimum access level."""
+              members = []
+              page = 1
+              endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+              if min_access_level:
+                  endpoint += f"&min_access_level={min_access_level}"
+              while True:
+                  result = self.get(endpoint)
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+                  endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+                  if min_access_level:
+                      endpoint += f"&min_access_level={min_access_level}"
+              return members
+
+      # GitLab access levels
+      ACCESS_LEVEL_DEVELOPER = 30
+      ACCESS_LEVEL_MAINTAINER = 40
+
+      def get_env_from_branch(branch):
+          return {'dev': 'dev', 'develop': 'dev', 'tst': 'tst', 'test': 'tst',
+                  'stg': 'stg', 'staging': 'stg', 'prd': 'prd', 'main': 'prd'}.get(branch, 'dev')
+
+      def get_excluded_emails():
+          """Get list of emails to exclude from notifications (from SMTP_EXCLUDE_EMAILS env var)."""
+          exclude_str = os.environ.get('SMTP_EXCLUDE_EMAILS', '')
+          if not exclude_str:
+              return []
+          return [e.strip().lower() for e in exclude_str.split(',') if e.strip()]
+
+      def is_excluded_email(email):
+          """Check if email should be excluded from notifications."""
+          if not email:
+              return True
+          email_lower = email.lower()
+          # Exclude service account emails (group_*@lazard.com) by default
+          if email_lower.startswith('group_'):
+              return True
+          # Check additional exclusions from SMTP_EXCLUDE_EMAILS
+          excluded = get_excluded_emails()
+          return email_lower in excluded
+
+      def get_user_email(user, email_domain=None):
+          """
+          Try to get user email from various fields.
+          GitLab API email visibility:
+            - 'email': Only visible to admins
+            - 'public_email': Only if user sets it in Profile settings
+            - 'commit_email': User's commit email (may be private)
+          Falls back to constructing email from username if domain provided.
+          """
+          # Try standard email fields
+          email = user.get('email') or user.get('public_email') or user.get('commit_email')
+
+          # Filter out GitLab's private commit email format
+          if email and '@users.noreply' in email:
+              email = None
+
+          # Fallback: construct from username + domain
+          if not email and email_domain:
+              username = user.get('username')
+              if username:
+                  email = f"{username}@{email_domain}"
+
+          return email
+
+      def collect_approvers(gl, project_id, env_name, email_domain=None):
+          approvers = {}
+          try:
+              env_config = gl.get_protected_env(project_id, env_name)
+          except Exception as e:
+              log_warn(f"Could not get protected environment: {e}")
+              return approvers
+
+          # Debug: show what we got from the API
+          log_info(f"Protected environment config keys: {list(env_config.keys())}")
+
+          # Only use approval_rules (not deploy_access_levels)
+          approval_rules = env_config.get('approval_rules', [])
+          log_info(f"Found {len(approval_rules)} approval_rules")
+
+          if not approval_rules:
+              log_warn("No approval_rules found in protected environment")
+              log_warn("Add approvers in Settings > CI/CD > Protected Environments > [env] > Approvers")
+              return approvers
+
+          for access in approval_rules:
+              user_id = access.get('user_id')
+              group_id = access.get('group_id')
+              access_level = access.get('access_level')
+
+              log_info(f"Processing approval rule: user_id={user_id}, group_id={group_id}, access_level={access_level}")
+
+              if user_id:
+                  # Specific user approver
+                  try:
+                      user = gl.get_user(user_id)
+                      email = get_user_email(user, email_domain)
+                      log_info(f"User {user_id} ({user.get('username')}): resolved email={email}")
+                      if email and not is_excluded_email(email):
+                          approvers[email] = user.get('name', 'Unknown')
+                      elif not email:
+                          log_warn(f"User {user_id} ({user.get('name')}, @{user.get('username')}) - no email found")
+                          log_warn(f"  User should set public email in GitLab Profile, or set EMAIL_DOMAIN variable")
+                  except Exception as e:
+                      log_warn(f"Could not get user {user_id}: {e}")
+              elif group_id:
+                  # Group approvers - include all members of the group
+                  try:
+                      members = gl.get_group_members(group_id)
+                      log_info(f"Approver group {group_id} has {len(members)} members")
+                      for member in members:
+                          email = get_user_email(member, email_domain)
+                          if email and not is_excluded_email(email):
+                              approvers[email] = member.get('name', 'Unknown')
+                          elif not email:
+                              log_warn(f"Group member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get group {group_id} members: {e}")
+              elif access_level:
+                  # Role-based approvers (e.g., all maintainers)
+                  try:
+                      members = gl.get_project_members(project_id, min_access_level=access_level)
+                      log_info(f"Found {len(members)} project members with access_level >= {access_level}")
+                      for member in members:
+                          if member.get('access_level', 0) >= access_level:
+                              email = get_user_email(member, email_domain)
+                              if email and not is_excluded_email(email):
+                                  approvers[email] = member.get('name', 'Unknown')
+                              elif not email:
+                                  log_warn(f"Project member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get project members for access_level {access_level}: {e}")
+
+          return approvers
+
+      def get_fallback_approvers():
+          """Get approvers from APPROVER_EMAILS environment variable."""
+          approver_emails = os.environ.get('APPROVER_EMAILS', '')
+          if not approver_emails:
+              return {}
+          approvers = {}
+          for email in approver_emails.split(','):
+              email = email.strip()
+              if email:
+                  # Use email prefix as name if no name provided
+                  name = email.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+                  approvers[email] = name
+          return approvers
+
+      def build_file_url(repo_url, branch, file_path):
+          if not repo_url or not file_path: return None
+          return f"{repo_url.rstrip('/').rstrip('.git')}/-/blob/{branch}/{file_path}"
+
+      def send_email(smtp_host, smtp_port, from_addr, from_name, to_emails, subject, html, text):
+          msg = MIMEMultipart('alternative')
+          msg['Subject'] = subject
+          msg['From'] = formataddr((from_name, from_addr)) if from_name else from_addr
+          msg['To'] = ', '.join(to_emails)
+          msg.attach(MIMEText(text, 'plain'))
+          msg.attach(MIMEText(html, 'html'))
+
+          try:
+              with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                  server.sendmail(from_addr, to_emails, msg.as_string())
+              return True
+          except Exception as e:
+              log_error(f"SMTP error: {e}")
+              return False
+
+      def main():
+          gitlab_url = os.environ.get('GITLAB_URL') or os.environ.get('CI_SERVER_URL')
+          gitlab_token = os.environ.get('GITLAB_TOKEN')
+          smtp_host = os.environ.get('SMTP_HOST')
+          smtp_from = os.environ.get('SMTP_FROM')
+          smtp_from_name = os.environ.get('SMTP_FROM_NAME', '')
+          smtp_port = int(os.environ.get('SMTP_PORT', '25'))
+          approver_emails_fallback = os.environ.get('APPROVER_EMAILS', '')
+
+          # Check minimum requirements
+          if not smtp_host or not smtp_from:
+              log_warn("Missing SMTP_HOST or SMTP_FROM - skipping notification")
+              return
+
+          if not gitlab_token and not approver_emails_fallback:
+              log_warn("Missing both GITLAB_TOKEN and APPROVER_EMAILS - skipping notification")
+              log_warn("Set GITLAB_TOKEN (with read_api scope, Maintainer access) or APPROVER_EMAILS")
+              return
+
+          project_id = os.environ.get('CI_PROJECT_ID')
+          branch = os.environ.get('CI_COMMIT_BRANCH', 'main')
+          env_name = get_env_from_branch(branch)
+
+          approvers = {}
+
+          # EMAIL_DOMAIN allows constructing email from username (default: lazard.com)
+          email_domain = os.environ.get('EMAIL_DOMAIN', 'lazard.com')
+          log_info(f"Email domain: {email_domain} (emails constructed as username@{email_domain})")
+
+          # Try to get approvers from GitLab API first
+          if gitlab_token and gitlab_url:
+              log_info(f"Collecting approvers for environment: {env_name}")
+              gl = GitLabClient(gitlab_url, gitlab_token)
+              approvers = collect_approvers(gl, project_id, env_name, email_domain or None)
+
+          # Fallback to APPROVER_EMAILS if API failed or returned no approvers
+          if not approvers and approver_emails_fallback:
+              log_info("Using APPROVER_EMAILS fallback")
+              approvers = get_fallback_approvers()
+
+          if not approvers:
+              log_warn("No approvers found - skipping notification")
+              log_warn("Either fix GITLAB_TOKEN permissions or set APPROVER_EMAILS variable")
+              return
+
+          log_info(f"Found {len(approvers)} approvers")
+
+          # Build context
+          operation = os.environ.get('OPERATION', 'Unknown')
+          pipeline_url = os.environ.get('CI_PIPELINE_URL', '')
+          project_name = os.environ.get('CI_PROJECT_NAME', 'APIM')
+          triggered_by = os.environ.get('GITLAB_USER_NAME', 'Unknown')
+          spec_file = os.environ.get('SPEC_FILE_PATH', '')
+          policy_file = os.environ.get('POLICY_FILE_PATH', '')
+          api_id = os.environ.get('API_NAME', '')
+          lob = os.environ.get('CI_PROJECT_ROOT_NAMESPACE', 'Unknown')
+          apim_instance = os.environ.get('APIM_SERVICE', 'Unknown')
+
+          # Timestamp in Eastern Time (New York)
+          eastern = timezone(timedelta(hours=-5))  # EST (adjust for DST if needed)
+          now_eastern = datetime.now(eastern)
+          timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+          # Risk indicator for destructive operations
+          destructive_ops = ['delete_api', 'clear_api_policy', 'clear_operation_policy']
+          is_destructive = operation in destructive_ops
+
+          spec_url = build_file_url(os.environ.get('SPEC_REPO_URL'), os.environ.get('SPEC_REPO_BRANCH', 'main'), spec_file)
+          policy_url = build_file_url(os.environ.get('POLICY_REPO_URL'), os.environ.get('POLICY_REPO_BRANCH', 'main'), policy_file)
+
+          details = []
+          if api_id: details.append(f"<tr><td><b>API ID:</b></td><td>{api_id}</td></tr>")
+          if spec_file:
+              link = f'<a href="{spec_url}">{spec_file}</a>' if spec_url else spec_file
+              details.append(f"<tr><td><b>Spec File:</b></td><td>{link}</td></tr>")
+          if policy_file:
+              link = f'<a href="{policy_url}">{policy_file}</a>' if policy_url else policy_file
+              details.append(f"<tr><td><b>Policy File:</b></td><td>{link}</td></tr>")
+
+          env_color = {'prd': '#dc3545', 'stg': '#fd7e14', 'tst': '#17a2b8', 'dev': '#28a745'}.get(env_name, '#6c757d')
+
+          risk_banner = '''<div style="background: #dc3545; color: white; padding: 12px 20px; margin-bottom: 15px; border-radius: 4px;">
+          <strong>⚠️ DESTRUCTIVE OPERATION</strong> - This action will permanently delete or clear resources. Please review carefully.
+          </div>''' if is_destructive else ''
+
+          html = f'''<!DOCTYPE html><html><head><style>
+          body {{ font-family: sans-serif; }}
+          .header {{ background: #1f75cb; color: white; padding: 20px; }}
+          .content {{ padding: 20px; background: #f5f5f5; }}
+          .details {{ background: white; padding: 15px; margin: 15px 0; }}
+          .details td {{ padding: 5px 10px; }}
+          .btn {{ background: #1f75cb; color: white; padding: 10px 20px; text-decoration: none; display: inline-block; }}
+          .env {{ background: {env_color}; color: white; padding: 2px 8px; font-size: 12px; }}
+          .lob {{ background: #6f42c1; color: white; padding: 2px 8px; font-size: 12px; }}
+          .risk {{ background: #dc3545; color: white; padding: 2px 8px; font-size: 12px; }}
+          .timestamp {{ color: #666; font-size: 12px; }}
+          </style></head><body>
+          <div class="header"><h2>Pipeline Approval Required</h2><span class="timestamp">Requested: {timestamp}</span></div>
+          <div class="content">
+          {risk_banner}
+          <p>A pipeline needs your approval to deploy to <span class="env">{env_name.upper()}</span></p>
+          <div class="details"><table>
+          <tr><td><b>LOB:</b></td><td><span class="lob">{lob.upper()}</span></td></tr>
+          <tr><td><b>APIM Instance:</b></td><td><code>{apim_instance}</code></td></tr>
+          <tr><td><b>Project:</b></td><td>{project_name}</td></tr>
+          <tr><td><b>Operation:</b></td><td><code>{operation}</code>{' <span class="risk">DESTRUCTIVE</span>' if is_destructive else ''}</td></tr>
+          <tr><td><b>Environment:</b></td><td>{env_name}</td></tr>
+          <tr><td><b>Triggered by:</b></td><td>{triggered_by}</td></tr>
+          <tr><td><b>Requested at:</b></td><td>{timestamp}</td></tr>
+          {''.join(details)}
+          </table></div>
+          <p><a href="{pipeline_url}" class="btn">Review Pipeline</a></p>
+          </div></body></html>'''
+
+          text = f'''PIPELINE APPROVAL REQUIRED
+          {"⚠️  DESTRUCTIVE OPERATION - This action will permanently delete or clear resources!" if is_destructive else ""}
+
+          LOB: {lob.upper()}
+          APIM Instance: {apim_instance}
+          Project: {project_name}
+          Operation: {operation} {"[DESTRUCTIVE]" if is_destructive else ""}
+          Environment: {env_name}
+          Triggered by: {triggered_by}
+          Requested at: {timestamp}
+          {"API ID: " + api_id if api_id else ""}
+          {"Spec File: " + spec_file if spec_file else ""}
+          {"Policy File: " + policy_file if policy_file else ""}
+
+          Review: {pipeline_url}'''
+
+          lob_prefix = f"[{lob.upper()}]" if lob and lob != 'Unknown' else "[APIM]"
+          env_label = "PRODUCTION" if env_name == 'prd' else env_name.upper()
+          subject = f"{lob_prefix} [{env_label}] Approval Required: {operation}"
+
+          if send_email(smtp_host, smtp_port, smtp_from, smtp_from_name, list(approvers.keys()), subject, html, text):
+              log_info("Notification emails sent successfully")
+              for email, name in approvers.items():
+                  log_info(f"  - {name} <{email}>")
+          else:
+              log_error("Failed to send notification emails")
+
+      if __name__ == '__main__':
+          main()
+      PYTHON_SCRIPT
+
+      python /tmp/notify_approvers.py
+  allow_failure: true  # Don't block pipeline if notification fails
+
+# ============================================
+# Deploy Base Templates
+# ============================================
+.deploy_base:
+  stage: deploy
+  image: $IMAGE_AZURE_CLI
+  timeout: 15 minutes
+  before_script:
+    - tdnf install -y git jq
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  artifacts:
+    paths:
+      - audit-*.json
+    expire_in: 30 days
+
+.deploy_base_with_spec:
+  extends: .deploy_base
+  before_script:
+    - tdnf install -y git jq
+    - curl -sL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+    - *clone_spec_repo
+
+.deploy_base_with_policy:
+  extends: .deploy_base
+  before_script:
+    - tdnf install -y git jq
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+    - *clone_policy_repo
+
+# ============================================
+# Script Templates
+# ============================================
+.import_api:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Importing API"
+      log_info "=========================================="
+
+      SPEC_PATH="${SPEC_CLONE_DIR}/${SPEC_FILE_PATH}"
+
+      # Read spec and extract metadata (using x-lzd-* custom attributes)
+      if [[ "$SPEC_PATH" == *.json ]]; then
+        SPEC_CONTENT=$(cat "$SPEC_PATH")
+        TITLE=$(echo "$SPEC_CONTENT" | jq -r '.info.title // empty')
+        DERIVED_API_NAME=$(echo "$SPEC_CONTENT" | jq -r '.["x-lzd-api-id"] // empty')
+        DERIVED_PATH=$(echo "$SPEC_CONTENT" | jq -r '.["x-lzd-api-path"] // empty')
+        SUBSCRIPTION_REQUIRED=$(echo "$SPEC_CONTENT" | jq -r '.["x-lzd-api-subscription-required"] // "true"')
+        SPEC_SUBSCRIPTION_KEY_HEADER=$(echo "$SPEC_CONTENT" | jq -r '.["x-lzd-api-subscription-key-header-name"] // empty')
+        SPEC_SUBSCRIPTION_KEY_QUERY=$(echo "$SPEC_CONTENT" | jq -r '.["x-lzd-api-subscription-key-query-param-name"] // empty')
+        # Extract tags as comma-separated string (e.g., "Orders,Payments,Internal")
+        API_TAGS=$(echo "$SPEC_CONTENT" | jq -r 'if .["x-lzd-api-tags"] then (.["x-lzd-api-tags"] | if type == "array" then join(",") else . end) else empty end')
+      else
+        SPEC_CONTENT=$(cat "$SPEC_PATH")
+        TITLE=$(yq eval '.info.title // ""' "$SPEC_PATH")
+        DERIVED_API_NAME=$(yq eval '.["x-lzd-api-id"] // ""' "$SPEC_PATH")
+        DERIVED_PATH=$(yq eval '.["x-lzd-api-path"] // ""' "$SPEC_PATH")
+        SUBSCRIPTION_REQUIRED=$(yq eval '.["x-lzd-api-subscription-required"] // "true"' "$SPEC_PATH")
+        SPEC_SUBSCRIPTION_KEY_HEADER=$(yq eval '.["x-lzd-api-subscription-key-header-name"] // ""' "$SPEC_PATH")
+        SPEC_SUBSCRIPTION_KEY_QUERY=$(yq eval '.["x-lzd-api-subscription-key-query-param-name"] // ""' "$SPEC_PATH")
+        # Extract tags as comma-separated string (use yq to JSON, then jq for type handling)
+        API_TAGS=$(yq eval -o=json '.["x-lzd-api-tags"]' "$SPEC_PATH" 2>/dev/null | jq -r 'if type == "array" then join(",") elif type == "string" then . else "" end')
+      fi
+
+      # Extract service URL from spec (OpenAPI 3.x uses servers array, Swagger 2.x uses host/basePath)
+      if [[ "$SPEC_PATH" == *.json ]]; then
+        # OpenAPI 3.x: servers[0].url
+        SPEC_SERVICE_URL=$(echo "$SPEC_CONTENT" | jq -r '.servers[0].url // empty')
+        # Swagger 2.x fallback: construct from host + basePath
+        if [ -z "$SPEC_SERVICE_URL" ]; then
+          SWAGGER_HOST=$(echo "$SPEC_CONTENT" | jq -r '.host // empty')
+          SWAGGER_BASE_PATH=$(echo "$SPEC_CONTENT" | jq -r '.basePath // ""')
+          SWAGGER_SCHEME=$(echo "$SPEC_CONTENT" | jq -r '.schemes[0] // "https"')
+          if [ -n "$SWAGGER_HOST" ]; then
+            SPEC_SERVICE_URL="${SWAGGER_SCHEME}://${SWAGGER_HOST}${SWAGGER_BASE_PATH}"
+          fi
+        fi
+      else
+        # YAML: OpenAPI 3.x servers[0].url
+        SPEC_SERVICE_URL=$(yq eval '.servers[0].url // ""' "$SPEC_PATH")
+        # Swagger 2.x fallback
+        if [ -z "$SPEC_SERVICE_URL" ]; then
+          SWAGGER_HOST=$(yq eval '.host // ""' "$SPEC_PATH")
+          SWAGGER_BASE_PATH=$(yq eval '.basePath // ""' "$SPEC_PATH")
+          SWAGGER_SCHEME=$(yq eval '.schemes[0] // "https"' "$SPEC_PATH")
+          if [ -n "$SWAGGER_HOST" ]; then
+            SPEC_SERVICE_URL="${SWAGGER_SCHEME}://${SWAGGER_HOST}${SWAGGER_BASE_PATH}"
+          fi
+        fi
+      fi
+
+      # Derive values from spec (x-lzd-api-path is required, x-lzd-api-id is optional)
+      FINAL_API_NAME="$DERIVED_API_NAME"
+      FINAL_DISPLAY_NAME="$TITLE"
+      FINAL_PATH="$DERIVED_PATH"
+      # Use spec service URL if available, otherwise fall back to BACKEND_URL
+      FINAL_SERVICE_URL="${SPEC_SERVICE_URL:-$BACKEND_URL}"
+      # Normalize subscription required value (default to true)
+      if [ "$SUBSCRIPTION_REQUIRED" != "true" ] && [ "$SUBSCRIPTION_REQUIRED" != "false" ]; then
+        SUBSCRIPTION_REQUIRED="true"
+      fi
+
+      # Auto-fix display name case for vendor APIs (e.g., "VeNDor: " -> "Vendor: ")
+      if echo "$FINAL_PATH" | grep -q "^vendors/"; then
+        if echo "$FINAL_DISPLAY_NAME" | grep -iq "^vendor: "; then
+          TITLE_FOR_ID=$(echo "$FINAL_DISPLAY_NAME" | sed 's/^[Vv][Ee][Nn][Dd][Oo][Rr]: //')
+          FINAL_DISPLAY_NAME="Vendor: $TITLE_FOR_ID"
+        fi
+      fi
+
+      # Auto-generate API ID from title if x-lzd-api-id not provided
+      if [ -z "$FINAL_API_NAME" ]; then
+        # Check if vendor API (path starts with vendors/)
+        if echo "$FINAL_PATH" | grep -q "^vendors/"; then
+          # Vendor API: extract part after "Vendor: " and add vendor- prefix
+          TITLE_FOR_ID=$(echo "$FINAL_DISPLAY_NAME" | sed 's/^Vendor: //')
+          FINAL_API_NAME="vendor-$(echo "$TITLE_FOR_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')"
+          log_info "Vendor API ID auto-generated: $FINAL_API_NAME"
+        else
+          # Internal API: generate from full title
+          FINAL_API_NAME=$(echo "$FINAL_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+          log_info "API ID auto-generated from title: $FINAL_API_NAME"
+        fi
+      fi
+
+      log_info "API ID: $FINAL_API_NAME"
+      log_info "Display Name: $FINAL_DISPLAY_NAME"
+      log_info "Path: $FINAL_PATH"
+      log_info "Service URL: $FINAL_SERVICE_URL"
+      log_info "Subscription Required: $SUBSCRIPTION_REQUIRED"
+      if [ -n "$API_TAGS" ]; then
+        log_info "Tags: $API_TAGS"
+      else
+        log_info "Tags: (none specified in x-lzd-api-tags)"
+      fi
+
+      # Detect spec format for az apim api import
+      case "$SPEC_PATH" in
+        *.json)
+          if echo "$SPEC_CONTENT" | jq -e '.openapi' > /dev/null 2>&1; then
+            SPEC_FORMAT_FLAG="OpenApi"
+          else
+            SPEC_FORMAT_FLAG="Swagger"
+          fi
+          ;;
+        *.yaml|*.yml)
+          SPEC_FORMAT_FLAG="OpenApi"
+          ;;
+      esac
+
+      # Build subscription key header name (use spec value if provided, otherwise default)
+      if [ -n "$SPEC_SUBSCRIPTION_KEY_HEADER" ]; then
+        SUBSCRIPTION_KEY_HEADER="$SPEC_SUBSCRIPTION_KEY_HEADER"
+        log_info "Subscription Key Header: $SUBSCRIPTION_KEY_HEADER (from spec)"
+      else
+        SUBSCRIPTION_KEY_HEADER="x-lzd-${CI_PROJECT_ROOT_NAMESPACE}-api-key"
+        log_info "Subscription Key Header: $SUBSCRIPTION_KEY_HEADER (default)"
+      fi
+
+      # Build subscription key query param name (use spec value if provided, otherwise default)
+      if [ -n "$SPEC_SUBSCRIPTION_KEY_QUERY" ]; then
+        SUBSCRIPTION_KEY_QUERY="$SPEC_SUBSCRIPTION_KEY_QUERY"
+        log_info "Subscription Key Query Param: $SUBSCRIPTION_KEY_QUERY (from spec)"
+      else
+        SUBSCRIPTION_KEY_QUERY="x-lzd-${CI_PROJECT_ROOT_NAMESPACE}-api-key"
+        log_info "Subscription Key Query Param: $SUBSCRIPTION_KEY_QUERY (default)"
+      fi
+
+      # Check if an API with the same path already exists
+      EXISTING_API_ID=$(az apim api list \
+        --resource-group "$RESOURCE_GROUP" \
+        --service-name "$APIM_SERVICE" \
+        --query "[?path=='$FINAL_PATH'].name | [0]" \
+        --output tsv 2>/dev/null)
+
+      if [ -n "$EXISTING_API_ID" ] && [ "$EXISTING_API_ID" != "null" ]; then
+        if [ "$EXISTING_API_ID" != "$FINAL_API_NAME" ]; then
+          # Path conflict - different API ID owns this path
+          log_error "=========================================="
+          log_error "PATH CONFLICT DETECTED"
+          log_error "=========================================="
+          log_error ""
+          log_error "The path '$FINAL_PATH' is already in use by a different API."
+          log_error ""
+          log_error "  Your spec API ID:    $FINAL_API_NAME"
+          log_error "  Existing API ID:     $EXISTING_API_ID"
+          log_error "  Conflicting path:    $FINAL_PATH"
+          log_error ""
+          log_error "To resolve this conflict, you have two options:"
+          log_error ""
+          log_error "  1. Update the existing API instead:"
+          log_error "     Set 'x-lzd-api-id: $EXISTING_API_ID' in your spec file"
+          log_error ""
+          log_error "  2. Use a different path:"
+          log_error "     Change 'x-lzd-api-path' to a unique path in your spec file"
+          log_error ""
+          log_error "  3. Delete the existing API first:"
+          log_error "     Run the pipeline with OPERATION=delete_api and API_NAME=$EXISTING_API_ID"
+          log_error ""
+          exit 1
+        else
+          log_info "Updating existing API: $FINAL_API_NAME"
+        fi
+      else
+        log_info "Creating new API: $FINAL_API_NAME"
+      fi
+
+      # Import API using native az apim api import
+      az apim api import \
+        --resource-group "$RESOURCE_GROUP" \
+        --service-name "$APIM_SERVICE" \
+        --api-id "$FINAL_API_NAME" \
+        --path "$FINAL_PATH" \
+        --display-name "$FINAL_DISPLAY_NAME" \
+        --specification-format "$SPEC_FORMAT_FLAG" \
+        --specification-path "$SPEC_PATH" \
+        --service-url "$FINAL_SERVICE_URL" \
+        --protocols https \
+        --subscription-required "$SUBSCRIPTION_REQUIRED" \
+        --subscription-key-header-name "$SUBSCRIPTION_KEY_HEADER" \
+        --subscription-key-query-param-name "$SUBSCRIPTION_KEY_QUERY" \
+        --output none
+
+      if [ $? -eq 0 ]; then
+        log_ok "API imported successfully"
+        log_audit "import_api" "$FINAL_API_NAME" "display_name=$FINAL_DISPLAY_NAME,path=$FINAL_PATH"
+
+        # Show API details
+        echo ""
+        echo "API Details:"
+        az apim api show \
+          --resource-group "$RESOURCE_GROUP" \
+          --service-name "$APIM_SERVICE" \
+          --api-id "$FINAL_API_NAME" \
+          --output json | jq '{name: .name, displayName: .displayName, path: .path, serviceUrl: .serviceUrl}'
+
+        # Apply tags if specified in spec (x-lzd-api-tags)
+        if [ -n "$API_TAGS" ]; then
+          log_info ""
+          log_info "Applying tags to API..."
+
+          # Split tags by comma and process each
+          IFS=',' read -ra TAG_ARRAY <<< "$API_TAGS"
+          for TAG_DISPLAY_NAME in "${TAG_ARRAY[@]}"; do
+            # Trim whitespace
+            TAG_DISPLAY_NAME=$(echo "$TAG_DISPLAY_NAME" | xargs)
+            if [ -n "$TAG_DISPLAY_NAME" ]; then
+              # Generate URL-safe tag ID from display name (lowercase, alphanumeric and hyphens only)
+              TAG_ID=$(echo "$TAG_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+
+              log_info "Processing tag: '$TAG_DISPLAY_NAME' (ID: $TAG_ID)"
+
+              # Step 1: Create tag in APIM service if it doesn't exist (PUT is idempotent)
+              CREATE_TAG_URL="${APIM_BASE_URL}/tags/${TAG_ID}?api-version=${AZURE_API_VERSION}"
+              TAG_CREATE_RESPONSE=$(az rest --method PUT \
+                --url "$CREATE_TAG_URL" \
+                --headers "Content-Type=application/json" \
+                --body "{\"properties\": {\"displayName\": \"$TAG_DISPLAY_NAME\"}}" \
+                --output json 2>&1) || true
+
+              if echo "$TAG_CREATE_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+                log_ok "  Tag exists/created: $TAG_DISPLAY_NAME"
+              else
+                log_warn "  Could not create tag: $TAG_DISPLAY_NAME"
+                log_warn "  Response: $TAG_CREATE_RESPONSE"
+                continue
+              fi
+
+              # Step 2: Assign tag to API using correct endpoint: PUT /apis/{apiId}/tags/{tagId}
+              # Reference: https://learn.microsoft.com/en-us/rest/api/apimanagement/current-ga/tag/assign-to-api
+              ASSIGN_TAG_URL="${APIM_BASE_URL}/apis/${FINAL_API_NAME}/tags/${TAG_ID}?api-version=${AZURE_API_VERSION}"
+              ASSIGN_TAG_RESPONSE=$(az rest --method PUT \
+                --url "$ASSIGN_TAG_URL" \
+                --headers "Content-Type=application/json" \
+                --body '{}' \
+                --output json 2>&1) || true
+
+              if echo "$ASSIGN_TAG_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+                log_ok "  Tag assigned to API: $TAG_DISPLAY_NAME"
+              else
+                log_warn "  Could not assign tag to API: $TAG_DISPLAY_NAME"
+                log_warn "  Response: $ASSIGN_TAG_RESPONSE"
+              fi
+            fi
+          done
+          log_audit "apply_tags" "$FINAL_API_NAME" "tags=$API_TAGS"
+        else
+          log_info ""
+          log_info "No tags to apply (x-lzd-api-tags not specified)"
+        fi
+      else
+        log_error "Failed to import API"
+        exit 1
+      fi
+
+.delete_api:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Deleting API: $API_NAME"
+      log_info "=========================================="
+
+      az apim api delete \
+        --resource-group "$RESOURCE_GROUP" \
+        --service-name "$APIM_SERVICE" \
+        --api-id "$API_NAME" \
+        --delete-revisions true \
+        --yes \
+        --output none
+
+      log_ok "API deleted successfully"
+      log_audit "delete_api" "$API_NAME" "status=deleted"
+
+.get_api_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Getting API Policy: $API_NAME"
+      log_info "=========================================="
+
+      if [ -z "$API_NAME" ]; then
+        log_error "API_NAME is required but not provided"
+        exit 1
+      fi
+
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/policies/policy?api-version=${AZURE_API_VERSION}"
+      log_info "Policy URL: $POLICY_URL"
+      
+      log_info "Verifying API exists..."
+      API_CHECK_URL="${APIM_BASE_URL}/apis/${API_NAME}?api-version=${AZURE_API_VERSION}"
+      
+      set +e
+      API_EXISTS=$(az rest --method GET \
+        --url "$API_CHECK_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+      API_CHECK_EXIT_CODE=$?
+      set -e
+      
+      if [ $API_CHECK_EXIT_CODE -ne 0 ]; then
+        log_error "Failed to verify API existence"
+        log_error "Exit code: $API_CHECK_EXIT_CODE"
+        log_error "Response: $API_EXISTS"
+        
+        if echo "$API_EXISTS" | grep -qi "ResourceNotFound" || echo "$API_EXISTS" | grep -qi "NotFound" || echo "$API_EXISTS" | grep -q "404"; then
+          log_error "API '$API_NAME' does not exist in APIM service '$APIM_SERVICE'"
+          log_info ""
+          log_info "Available APIs can be listed using: OPERATION=list_apis"
+          exit 1
+        else
+          log_error "Unexpected error while checking API"
+          exit 1
+        fi
+      fi
+      
+      log_ok "API '$API_NAME' exists"
+      
+      log_info "Retrieving API policy..."
+      
+      set +e
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+      HTTP_EXIT_CODE=$?
+      set -e
+
+      # Create output directory for artifacts
+      mkdir -p policy-output
+
+      # Check for XML response first
+      if echo "$HTTP_RESPONSE" | grep -q "^WARNING: Not a json response" || echo "$HTTP_RESPONSE" | grep -q "<policies>"; then
+        log_ok "API policy retrieved successfully (XML format)"
+
+        # Extract just the XML content (remove az cli warnings)
+        POLICY_CONTENT=$(echo "$HTTP_RESPONSE" | grep -v "^WARNING:" | grep -v "^$" || echo "$HTTP_RESPONSE")
+
+        echo ""
+        echo "Policy Content:"
+        echo "=========================================="
+        echo "$POLICY_CONTENT"
+        echo "=========================================="
+        echo ""
+
+        # Save policy to file
+        POLICY_FILENAME="policy-output/${API_NAME}-policy.xml"
+        echo "$POLICY_CONTENT" > "$POLICY_FILENAME"
+        log_ok "Policy saved to artifact: $POLICY_FILENAME"
+
+        POLICY_SIZE=$(echo -n "$POLICY_CONTENT" | wc -c)
+        log_info "Policy size: $POLICY_SIZE bytes"
+        log_audit "get_api_policy" "$API_NAME" "status=success,size=$POLICY_SIZE"
+        exit 0
+      fi
+
+      # Check exit code for errors
+      if [ $HTTP_EXIT_CODE -ne 0 ]; then
+        log_error "az rest command failed with exit code: $HTTP_EXIT_CODE"
+        log_error "Response: $HTTP_RESPONSE"
+        
+        ERROR_CODE=$(echo "$HTTP_RESPONSE" | jq -r '.error.code // empty' 2>/dev/null || echo "")
+        ERROR_MESSAGE=$(echo "$HTTP_RESPONSE" | jq -r '.error.message // empty' 2>/dev/null || echo "")
+        
+        if [ -n "$ERROR_CODE" ]; then
+          log_error "Error Code: $ERROR_CODE"
+        fi
+        if [ -n "$ERROR_MESSAGE" ]; then
+          log_error "Error Message: $ERROR_MESSAGE"
+        fi
+        
+        # Handle "PoliciesConfiguration not found"
+        if echo "$HTTP_RESPONSE" | grep -q "PoliciesConfiguration not found"; then
+          log_error "No custom policy configured for API: $API_NAME"
+          log_error "Reason: PoliciesConfiguration not found - API is using default/inherited policy"
+          log_info ""
+          log_info "The API is using the default policy template structure:"
+          echo ""
+          echo "=========================================="
+          echo '<!--'
+          echo '    - Policies are applied in the order they appear.'
+          echo '    - Position <base/> inside a section to inherit policies from the outer scope.'
+          echo '    - Comments within policies are not preserved.'
+          echo '-->'
+          echo '<!-- Add policies as children to the <inbound>, <outbound>, <backend>, and <on-error> elements -->'
+          echo '<policies>'
+          echo '    <!-- Throttle, authorize, validate, cache, or transform the requests -->'
+          echo '    <inbound>'
+          echo '        <base />'
+          echo '    </inbound>'
+          echo '    <!-- Control if and how the requests are forwarded to services  -->'
+          echo '    <backend>'
+          echo '        <base />'
+          echo '    </backend>'
+          echo '    <!-- Customize the responses -->'
+          echo '    <outbound>'
+          echo '        <base />'
+          echo '    </outbound>'
+          echo '    <!-- Handle exceptions and customize error responses  -->'
+          echo '    <on-error>'
+          echo '        <base />'
+          echo '    </on-error>'
+          echo '</policies>'
+          echo "=========================================="
+          echo ""
+          log_info "Note: This template is not stored in Azure. To set a custom policy, use OPERATION=set_api_policy"
+          log_audit "get_api_policy" "$API_NAME" "status=no_custom_policy"
+          exit 1
+        elif echo "$HTTP_RESPONSE" | grep -qi "ResourceNotFound" || echo "$HTTP_RESPONSE" | grep -qi "NotFound" || echo "$HTTP_RESPONSE" | grep -q "404"; then
+          log_error "No policy found for API: $API_NAME"
+          log_error "Reason: ResourceNotFound (404)"
+          log_audit "get_api_policy" "$API_NAME" "status=not_found"
+          exit 1
+        elif echo "$HTTP_RESPONSE" | grep -qi "Unauthorized" || echo "$HTTP_RESPONSE" | grep -qi "Forbidden" || echo "$HTTP_RESPONSE" | grep -q "401" || echo "$HTTP_RESPONSE" | grep -q "403"; then
+          log_error "Permission denied. Check Azure service principal permissions"
+          log_error "Reason: Unauthorized/Forbidden"
+          exit 1
+        else
+          log_error "Unexpected error retrieving policy"
+          exit 1
+        fi
+      fi
+
+      # Try to parse as JSON
+      if echo "$HTTP_RESPONSE" | jq -e '.' > /dev/null 2>&1; then
+        if echo "$HTTP_RESPONSE" | jq -e '.properties.value' > /dev/null 2>&1; then
+          POLICY_CONTENT=$(echo "$HTTP_RESPONSE" | jq -r '.properties.value')
+          
+          if [ -z "$POLICY_CONTENT" ] || [ "$POLICY_CONTENT" = "null" ]; then
+            log_error "Policy object exists but content is empty"
+            log_error "Reason: Empty policy content in JSON response"
+            log_audit "get_api_policy" "$API_NAME" "status=empty"
+            exit 1
+          else
+            log_ok "API policy retrieved successfully (JSON format)"
+            echo ""
+            echo "Policy Content:"
+            echo "=========================================="
+            echo "$POLICY_CONTENT"
+            echo "=========================================="
+            echo ""
+
+            # Save policy to file
+            POLICY_FILENAME="policy-output/${API_NAME}-policy.xml"
+            echo "$POLICY_CONTENT" > "$POLICY_FILENAME"
+            log_ok "Policy saved to artifact: $POLICY_FILENAME"
+
+            POLICY_SIZE=$(echo -n "$POLICY_CONTENT" | wc -c)
+            log_info "Policy size: $POLICY_SIZE bytes"
+            log_audit "get_api_policy" "$API_NAME" "status=success,size=$POLICY_SIZE"
+            exit 0
+          fi
+        else
+          log_error "No policy found for API: $API_NAME"
+          log_error "Reason: Missing .properties.value in JSON response"
+          log_audit "get_api_policy" "$API_NAME" "status=not_found"
+          exit 1
+        fi
+      else
+        log_error "Response is not valid JSON or XML"
+        log_error "Raw response: $HTTP_RESPONSE"
+        exit 1
+      fi
+
+.set_api_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Setting API Policy: $API_NAME"
+      log_info "=========================================="
+
+      POLICY_PATH="${POLICY_CLONE_DIR}/${POLICY_FILE_PATH}"
+      
+      # Validate policy file exists
+      if [ ! -f "$POLICY_PATH" ]; then
+        log_error "Policy file not found: $POLICY_PATH"
+        exit 1
+      fi
+
+      # Validate policy file is not empty
+      if [ ! -s "$POLICY_PATH" ]; then
+        log_error "Policy file is empty: $POLICY_PATH"
+        exit 1
+      fi
+
+      # Validate policy file contains APIM policy structure
+      if ! grep -q '<policies>' "$POLICY_PATH"; then
+        log_error "Policy file does not appear to be valid APIM policy XML"
+        exit 1
+      fi
+
+      log_info "Policy file validated: $POLICY_PATH"
+
+      # Transform policy XML: replace " with &quot; inside @(...) expressions
+      log_info "Transforming policy for APIM compatibility..."
+      
+      cat > /tmp/transform_policy.py << 'PYTHON_SCRIPT_EOF'
+      #!/usr/bin/env python3
+      """
+      Transform APIM policy XML by replacing double quotes with &quot; inside @(...) expressions.
+      This handles nested parentheses correctly using a depth-tracking state machine.
+      """
+      import sys
+
+      def transform_apim_policy(content):
+          """
+          Transform policy content by escaping quotes inside @(...) expressions.
+          
+          Args:
+              content: The raw policy XML content
+              
+          Returns:
+              Transformed content with quotes escaped inside @(...) expressions
+          """
+          result = []
+          i = 0
+          content_len = len(content)
+          
+          while i < content_len:
+              # Look for @( pattern (start of APIM expression)
+              if i < content_len - 1 and content[i:i+2] == '@(':
+                  # Found start of expression
+                  expr_start = i
+                  i += 2
+                  depth = 1
+                  expr_chars = ['@', '(']
+                  
+                  # Track through the expression, counting parentheses depth
+                  while i < content_len and depth > 0:
+                      char = content[i]
+                      expr_chars.append(char)
+                      
+                      if char == '(':
+                          depth += 1
+                      elif char == ')':
+                          depth -= 1
+                      
+                      i += 1
+                  
+                  # Now we have the complete @(...) expression
+                  expression = ''.join(expr_chars)
+                  
+                  # Replace " with &quot; inside this expression only
+                  # This preserves the C# code structure while making it APIM-compatible
+                  transformed = expression.replace('"', '&quot;')
+                  result.append(transformed)
+              else:
+                  # Regular character outside @(...) expressions - keep as-is
+                  result.append(content[i])
+                  i += 1
+          
+          return ''.join(result)
+
+      def main():
+          """Main entry point."""
+          try:
+              # Read input file path from command line argument
+              if len(sys.argv) != 3:
+                  print("Usage: transform_policy.py <input_file> <output_file>", file=sys.stderr)
+                  sys.exit(1)
+              
+              input_file = sys.argv[1]
+              output_file = sys.argv[2]
+              
+              # Read the policy file
+              try:
+                  with open(input_file, 'r', encoding='utf-8') as f:
+                      content = f.read()
+              except FileNotFoundError:
+                  print(f"Error: Input file not found: {input_file}", file=sys.stderr)
+                  sys.exit(1)
+              except Exception as e:
+                  print(f"Error reading input file: {e}", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Validate input is not empty
+              if not content.strip():
+                  print("Error: Input file is empty", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Transform the content
+              transformed = transform_apim_policy(content)
+              
+              # Write to output file
+              try:
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      f.write(transformed)
+              except Exception as e:
+                  print(f"Error writing output file: {e}", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Success
+              sys.exit(0)
+              
+          except Exception as e:
+              print(f"Unexpected error: {e}", file=sys.stderr)
+              sys.exit(1)
+
+      if __name__ == '__main__':
+          main()
+      PYTHON_SCRIPT_EOF
+
+      # Run the transformation
+      if ! python3 /tmp/transform_policy.py "$POLICY_PATH" /tmp/policy_transformed.xml; then
+        log_error "Failed to transform policy XML"
+        exit 1
+      fi
+
+      # Verify transformed file was created and is not empty
+      if [ ! -s /tmp/policy_transformed.xml ]; then
+        log_error "Transformed policy file is empty or was not created"
+        exit 1
+      fi
+
+      log_ok "Policy transformed successfully"
+
+      # Get Azure access token for direct REST API call
+      log_info "Getting Azure AD access token..."
+      TOKEN_RESPONSE=$(curl -s -X POST \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=client_credentials&client_id=${AZ_SPN_CLIENT_ID}&client_secret=${AZ_SPN_CLIENT_SECRET}&resource=https://management.azure.com/" \
+        "https://login.microsoftonline.com/${AZ_TENANT_ID}/oauth2/token" 2>&1)
+
+      if [ $? -ne 0 ]; then
+        log_error "Failed to request access token"
+        log_error "Error: $TOKEN_RESPONSE"
+        exit 1
+      fi
+
+      ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token' 2>/dev/null)
+
+      if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+        log_error "Failed to get access token from response"
+        log_error "Response: $TOKEN_RESPONSE"
+        exit 1
+      fi
+
+      log_ok "Access token acquired successfully"
+
+      # Build policy URL using current API version
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/policies/policy?api-version=${AZURE_API_VERSION}"
+      log_info "Policy URL: $POLICY_URL"
+
+      # Get current ETag (if policy exists) for safe updates
+      log_info "Checking for existing policy..."
+      ETAG_HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        "$POLICY_URL" 2>&1)
+
+      ETAG=""
+      CURL_OPTS=()
+      
+      if [ "$ETAG_HTTP_STATUS" -eq 200 ]; then
+        ETAG=$(curl -s -D - -o /dev/null \
+          -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+          "$POLICY_URL" 2>/dev/null | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r\n')
+        
+        if [ -n "$ETAG" ]; then
+          log_info "Existing policy found. ETag: $ETAG"
+          CURL_OPTS+=(-H "If-Match: ${ETAG}")
+        else
+          log_warn "Policy exists but no ETag found"
+        fi
+      elif [ "$ETAG_HTTP_STATUS" -eq 404 ]; then
+        log_info "No existing policy found (new deployment)"
+      else
+        log_warn "Unexpected status when checking for existing policy: $ETAG_HTTP_STATUS"
+      fi
+
+      # Deploy policy using raw XML upload with transformed file
+      log_info "Deploying policy to Azure APIM..."
+      HTTP_STATUS=$(curl -s -o /tmp/policy_response.txt -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "Content-Type: application/vnd.ms-azure-apim.policy+xml" \
+        "${CURL_OPTS[@]}" \
+        --data-binary "@/tmp/policy_transformed.xml" \
+        "$POLICY_URL" 2>&1)
+
+      CURL_EXIT_CODE=$?
+
+      if [ $CURL_EXIT_CODE -ne 0 ]; then
+        log_error "curl command failed with exit code: $CURL_EXIT_CODE"
+        exit 1
+      fi
+
+      log_info "HTTP Status: $HTTP_STATUS"
+      
+      if [ "$HTTP_STATUS" -ne 200 ] && [ "$HTTP_STATUS" -ne 201 ]; then
+        log_error "Failed to set API policy"
+        log_error "HTTP Status: $HTTP_STATUS"
+        log_error "Response:"
+        cat /tmp/policy_response.txt
+        exit 1
+      fi
+
+      log_ok "API policy set successfully"
+      log_audit "set_api_policy" "$API_NAME" "policy_file=$POLICY_FILE_PATH"
+      
+.clear_api_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Clearing API Policy: $API_NAME"
+      log_info "=========================================="
+
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/policies/policy?api-version=${AZURE_API_VERSION}"
+
+      az rest --method DELETE \
+        --url "$POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1 || true
+
+      log_ok "API policy cleared"
+      log_audit "clear_api_policy" "$API_NAME" "status=cleared"
+
+.get_operation_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Getting Operation Policy"
+      log_info "API: $API_NAME | Operation: $OPERATION_ID"
+      log_info "=========================================="
+
+      if [ -z "$API_NAME" ]; then
+        log_error "API_NAME is required but not provided"
+        exit 1
+      fi
+
+      if [ -z "$OPERATION_ID" ]; then
+        log_error "OPERATION_ID is required but not provided"
+        exit 1
+      fi
+
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/operations/${OPERATION_ID}/policies/policy?api-version=${AZURE_API_VERSION}"
+      log_info "Policy URL: $POLICY_URL"
+
+      log_info "Verifying API and operation exist..."
+      OPERATION_CHECK_URL="${APIM_BASE_URL}/apis/${API_NAME}/operations/${OPERATION_ID}?api-version=${AZURE_API_VERSION}"
+
+      set +e
+      OPERATION_EXISTS=$(az rest --method GET \
+        --url "$OPERATION_CHECK_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+      OPERATION_CHECK_EXIT_CODE=$?
+      set -e
+
+      if [ $OPERATION_CHECK_EXIT_CODE -ne 0 ]; then
+        log_error "Failed to verify operation existence"
+        log_error "Exit code: $OPERATION_CHECK_EXIT_CODE"
+        log_error "Response: $OPERATION_EXISTS"
+
+        if echo "$OPERATION_EXISTS" | grep -qi "ResourceNotFound" || echo "$OPERATION_EXISTS" | grep -qi "NotFound" || echo "$OPERATION_EXISTS" | grep -q "404"; then
+          log_error "Operation '$OPERATION_ID' does not exist for API '$API_NAME' in APIM service '$APIM_SERVICE'"
+          log_info ""
+          log_info "Available operations can be listed using: OPERATION=list_operations API_NAME=$API_NAME"
+          exit 1
+        else
+          log_error "Unexpected error while checking operation"
+          exit 1
+        fi
+      fi
+
+      log_ok "Operation '$OPERATION_ID' exists for API '$API_NAME'"
+
+      log_info "Retrieving operation policy..."
+
+      set +e
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1)
+      HTTP_EXIT_CODE=$?
+      set -e
+
+      # Create output directory for artifacts
+      mkdir -p policy-output
+
+      # Check for XML response first
+      if echo "$HTTP_RESPONSE" | grep -q "^WARNING: Not a json response" || echo "$HTTP_RESPONSE" | grep -q "<policies>"; then
+        log_ok "Operation policy retrieved successfully (XML format)"
+
+        # Extract just the XML content (remove az cli warnings)
+        POLICY_CONTENT=$(echo "$HTTP_RESPONSE" | grep -v "^WARNING:" | grep -v "^$" || echo "$HTTP_RESPONSE")
+
+        echo ""
+        echo "Policy Content:"
+        echo "=========================================="
+        echo "$POLICY_CONTENT"
+        echo "=========================================="
+        echo ""
+
+        # Save policy to file
+        POLICY_FILENAME="policy-output/${API_NAME}-${OPERATION_ID}-policy.xml"
+        echo "$POLICY_CONTENT" > "$POLICY_FILENAME"
+        log_ok "Policy saved to artifact: $POLICY_FILENAME"
+
+        POLICY_SIZE=$(echo -n "$POLICY_CONTENT" | wc -c)
+        log_info "Policy size: $POLICY_SIZE bytes"
+        log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=success,size=$POLICY_SIZE"
+        exit 0
+      fi
+
+      # Check exit code for errors
+      if [ $HTTP_EXIT_CODE -ne 0 ]; then
+        log_error "az rest command failed with exit code: $HTTP_EXIT_CODE"
+        log_error "Response: $HTTP_RESPONSE"
+
+        ERROR_CODE=$(echo "$HTTP_RESPONSE" | jq -r '.error.code // empty' 2>/dev/null || echo "")
+        ERROR_MESSAGE=$(echo "$HTTP_RESPONSE" | jq -r '.error.message // empty' 2>/dev/null || echo "")
+
+        if [ -n "$ERROR_CODE" ]; then
+          log_error "Error Code: $ERROR_CODE"
+        fi
+        if [ -n "$ERROR_MESSAGE" ]; then
+          log_error "Error Message: $ERROR_MESSAGE"
+        fi
+
+        # Handle "PoliciesConfiguration not found"
+        if echo "$HTTP_RESPONSE" | grep -q "PoliciesConfiguration not found"; then
+          log_error "No custom policy configured for operation: $OPERATION_ID"
+          log_error "Reason: PoliciesConfiguration not found - operation is using default/inherited policy"
+          log_info ""
+          log_info "The operation is using the default policy template structure:"
+          echo ""
+          echo "=========================================="
+          echo '<!--'
+          echo '    - Policies are applied in the order they appear.'
+          echo '    - Position <base/> inside a section to inherit policies from the outer scope.'
+          echo '    - Comments within policies are not preserved.'
+          echo '-->'
+          echo '<!-- Add policies as children to the <inbound>, <outbound>, <backend>, and <on-error> elements -->'
+          echo '<policies>'
+          echo '    <!-- Throttle, authorize, validate, cache, or transform the requests -->'
+          echo '    <inbound>'
+          echo '        <base />'
+          echo '    </inbound>'
+          echo '    <!-- Control if and how the requests are forwarded to services  -->'
+          echo '    <backend>'
+          echo '        <base />'
+          echo '    </backend>'
+          echo '    <!-- Customize the responses -->'
+          echo '    <outbound>'
+          echo '        <base />'
+          echo '    </outbound>'
+          echo '    <!-- Handle exceptions and customize error responses  -->'
+          echo '    <on-error>'
+          echo '        <base />'
+          echo '    </on-error>'
+          echo '</policies>'
+          echo "=========================================="
+          echo ""
+          log_info "Note: This template is not stored in Azure. To set a custom policy, use OPERATION=set_operation_policy"
+          log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=no_custom_policy"
+          exit 1
+        elif echo "$HTTP_RESPONSE" | grep -qi "ResourceNotFound" || echo "$HTTP_RESPONSE" | grep -qi "NotFound" || echo "$HTTP_RESPONSE" | grep -q "404"; then
+          log_error "No policy found for operation: $OPERATION_ID"
+          log_error "Reason: ResourceNotFound (404)"
+          log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=not_found"
+          exit 1
+        elif echo "$HTTP_RESPONSE" | grep -qi "Unauthorized" || echo "$HTTP_RESPONSE" | grep -qi "Forbidden" || echo "$HTTP_RESPONSE" | grep -q "401" || echo "$HTTP_RESPONSE" | grep -q "403"; then
+          log_error "Permission denied. Check Azure service principal permissions"
+          log_error "Reason: Unauthorized/Forbidden"
+          exit 1
+        else
+          log_error "Unexpected error retrieving policy"
+          exit 1
+        fi
+      fi
+
+      # Try to parse as JSON
+      if echo "$HTTP_RESPONSE" | jq -e '.' > /dev/null 2>&1; then
+        if echo "$HTTP_RESPONSE" | jq -e '.properties.value' > /dev/null 2>&1; then
+          POLICY_CONTENT=$(echo "$HTTP_RESPONSE" | jq -r '.properties.value')
+
+          if [ -z "$POLICY_CONTENT" ] || [ "$POLICY_CONTENT" = "null" ]; then
+            log_error "Policy object exists but content is empty"
+            log_error "Reason: Empty policy content in JSON response"
+            log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=empty"
+            exit 1
+          else
+            log_ok "Operation policy retrieved successfully (JSON format)"
+            echo ""
+            echo "Policy Content:"
+            echo "=========================================="
+            echo "$POLICY_CONTENT"
+            echo "=========================================="
+            echo ""
+
+            # Save policy to file
+            POLICY_FILENAME="policy-output/${API_NAME}-${OPERATION_ID}-policy.xml"
+            echo "$POLICY_CONTENT" > "$POLICY_FILENAME"
+            log_ok "Policy saved to artifact: $POLICY_FILENAME"
+
+            POLICY_SIZE=$(echo -n "$POLICY_CONTENT" | wc -c)
+            log_info "Policy size: $POLICY_SIZE bytes"
+            log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=success,size=$POLICY_SIZE"
+            exit 0
+          fi
+        else
+          log_error "No policy found for operation: $OPERATION_ID"
+          log_error "Reason: Missing .properties.value in JSON response"
+          log_audit "get_operation_policy" "$API_NAME/$OPERATION_ID" "status=not_found"
+          exit 1
+        fi
+      else
+        log_error "Response is not valid JSON or XML"
+        log_error "Raw response: $HTTP_RESPONSE"
+        exit 1
+      fi
+
+.set_operation_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Setting Operation Policy"
+      log_info "API: $API_NAME | Operation: $OPERATION_ID"
+      log_info "=========================================="
+
+      POLICY_PATH="${POLICY_CLONE_DIR}/${POLICY_FILE_PATH}"
+      
+      # Validate policy file exists
+      if [ ! -f "$POLICY_PATH" ]; then
+        log_error "Policy file not found: $POLICY_PATH"
+        exit 1
+      fi
+
+      # Validate policy file is not empty
+      if [ ! -s "$POLICY_PATH" ]; then
+        log_error "Policy file is empty: $POLICY_PATH"
+        exit 1
+      fi
+
+      # Validate policy file contains APIM policy structure
+      if ! grep -q '<policies>' "$POLICY_PATH"; then
+        log_error "Policy file does not appear to be valid APIM policy XML"
+        exit 1
+      fi
+
+      log_info "Policy file validated: $POLICY_PATH"
+
+      # Transform policy XML: replace " with &quot; inside @(...) expressions
+      log_info "Transforming policy for APIM compatibility..."
+      
+      cat > /tmp/transform_policy.py << 'PYTHON_SCRIPT_EOF'
+      #!/usr/bin/env python3
+      """
+      Transform APIM policy XML by replacing double quotes with &quot; inside @(...) expressions.
+      This handles nested parentheses correctly using a depth-tracking state machine.
+      """
+      import sys
+
+      def transform_apim_policy(content):
+          """
+          Transform policy content by escaping quotes inside @(...) expressions.
+          
+          Args:
+              content: The raw policy XML content
+              
+          Returns:
+              Transformed content with quotes escaped inside @(...) expressions
+          """
+          result = []
+          i = 0
+          content_len = len(content)
+          
+          while i < content_len:
+              # Look for @( pattern (start of APIM expression)
+              if i < content_len - 1 and content[i:i+2] == '@(':
+                  # Found start of expression
+                  expr_start = i
+                  i += 2
+                  depth = 1
+                  expr_chars = ['@', '(']
+                  
+                  # Track through the expression, counting parentheses depth
+                  while i < content_len and depth > 0:
+                      char = content[i]
+                      expr_chars.append(char)
+                      
+                      if char == '(':
+                          depth += 1
+                      elif char == ')':
+                          depth -= 1
+                      
+                      i += 1
+                  
+                  # Now we have the complete @(...) expression
+                  expression = ''.join(expr_chars)
+                  
+                  # Replace " with &quot; inside this expression only
+                  # This preserves the C# code structure while making it APIM-compatible
+                  transformed = expression.replace('"', '&quot;')
+                  result.append(transformed)
+              else:
+                  # Regular character outside @(...) expressions - keep as-is
+                  result.append(content[i])
+                  i += 1
+          
+          return ''.join(result)
+
+      def main():
+          """Main entry point."""
+          try:
+              # Read input file path from command line argument
+              if len(sys.argv) != 3:
+                  print("Usage: transform_policy.py <input_file> <output_file>", file=sys.stderr)
+                  sys.exit(1)
+              
+              input_file = sys.argv[1]
+              output_file = sys.argv[2]
+              
+              # Read the policy file
+              try:
+                  with open(input_file, 'r', encoding='utf-8') as f:
+                      content = f.read()
+              except FileNotFoundError:
+                  print(f"Error: Input file not found: {input_file}", file=sys.stderr)
+                  sys.exit(1)
+              except Exception as e:
+                  print(f"Error reading input file: {e}", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Validate input is not empty
+              if not content.strip():
+                  print("Error: Input file is empty", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Transform the content
+              transformed = transform_apim_policy(content)
+              
+              # Write to output file
+              try:
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      f.write(transformed)
+              except Exception as e:
+                  print(f"Error writing output file: {e}", file=sys.stderr)
+                  sys.exit(1)
+              
+              # Success
+              sys.exit(0)
+              
+          except Exception as e:
+              print(f"Unexpected error: {e}", file=sys.stderr)
+              sys.exit(1)
+
+      if __name__ == '__main__':
+          main()
+      PYTHON_SCRIPT_EOF
+
+      # Run the transformation
+      if ! python3 /tmp/transform_policy.py "$POLICY_PATH" /tmp/policy_transformed.xml; then
+        log_error "Failed to transform policy XML"
+        exit 1
+      fi
+
+      # Verify transformed file was created and is not empty
+      if [ ! -s /tmp/policy_transformed.xml ]; then
+        log_error "Transformed policy file is empty or was not created"
+        exit 1
+      fi
+
+      log_ok "Policy transformed successfully"
+
+      # Get Azure access token for direct REST API call
+      log_info "Getting Azure AD access token..."
+      TOKEN_RESPONSE=$(curl -s -X POST \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=client_credentials&client_id=${AZ_SPN_CLIENT_ID}&client_secret=${AZ_SPN_CLIENT_SECRET}&resource=https://management.azure.com/" \
+        "https://login.microsoftonline.com/${AZ_TENANT_ID}/oauth2/token" 2>&1)
+
+      if [ $? -ne 0 ]; then
+        log_error "Failed to request access token"
+        log_error "Error: $TOKEN_RESPONSE"
+        exit 1
+      fi
+
+      ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token' 2>/dev/null)
+
+      if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+        log_error "Failed to get access token from response"
+        log_error "Response: $TOKEN_RESPONSE"
+        exit 1
+      fi
+
+      log_ok "Access token acquired successfully"
+
+      # Build policy URL using current API version
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/operations/${OPERATION_ID}/policies/policy?api-version=${AZURE_API_VERSION}"
+      log_info "Policy URL: $POLICY_URL"
+
+      # Get current ETag (if policy exists) for safe updates
+      log_info "Checking for existing policy..."
+      ETAG_HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        "$POLICY_URL" 2>&1)
+
+      ETAG=""
+      CURL_OPTS=()
+      
+      if [ "$ETAG_HTTP_STATUS" -eq 200 ]; then
+        ETAG=$(curl -s -D - -o /dev/null \
+          -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+          "$POLICY_URL" 2>/dev/null | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r\n')
+        
+        if [ -n "$ETAG" ]; then
+          log_info "Existing policy found. ETag: $ETAG"
+          CURL_OPTS+=(-H "If-Match: ${ETAG}")
+        else
+          log_warn "Policy exists but no ETag found"
+        fi
+      elif [ "$ETAG_HTTP_STATUS" -eq 404 ]; then
+        log_info "No existing policy found (new deployment)"
+      else
+        log_warn "Unexpected status when checking for existing policy: $ETAG_HTTP_STATUS"
+      fi
+
+      # Deploy policy using raw XML upload with transformed file
+      log_info "Deploying policy to Azure APIM..."
+      HTTP_STATUS=$(curl -s -o /tmp/policy_response.txt -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "Content-Type: application/vnd.ms-azure-apim.policy+xml" \
+        "${CURL_OPTS[@]}" \
+        --data-binary "@/tmp/policy_transformed.xml" \
+        "$POLICY_URL" 2>&1)
+
+      CURL_EXIT_CODE=$?
+
+      if [ $CURL_EXIT_CODE -ne 0 ]; then
+        log_error "curl command failed with exit code: $CURL_EXIT_CODE"
+        exit 1
+      fi
+
+      log_info "HTTP Status: $HTTP_STATUS"
+      
+      if [ "$HTTP_STATUS" -ne 200 ] && [ "$HTTP_STATUS" -ne 201 ]; then
+        log_error "Failed to set operation policy"
+        log_error "HTTP Status: $HTTP_STATUS"
+        log_error "Response:"
+        cat /tmp/policy_response.txt
+        exit 1
+      fi
+
+      log_ok "Operation policy set successfully"
+      log_audit "set_operation_policy" "$API_NAME/$OPERATION_ID" "policy_file=$POLICY_FILE_PATH"
+
+.clear_operation_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Clearing Operation Policy"
+      log_info "API: $API_NAME | Operation: $OPERATION_ID"
+      log_info "=========================================="
+
+      POLICY_URL="${APIM_BASE_URL}/apis/${API_NAME}/operations/${OPERATION_ID}/policies/policy?api-version=${AZURE_API_VERSION}"
+
+      az rest --method DELETE \
+        --url "$POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1 || true
+
+      log_ok "Operation policy cleared"
+      log_audit "clear_operation_policy" "$API_NAME/$OPERATION_ID" "status=cleared"
+
+# ============================================
+# Deploy Jobs - Dev Environment
+# ============================================
+import_api_dev:
+  extends: .deploy_base_with_spec
+  needs: ["validate_inputs", "validate_spec", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
+      when: manual
+  script:
+    - !reference [.import_api, script]
+
+delete_api_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_api", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
+      when: manual
+  script:
+    - !reference [.delete_api, script]
+
+get_api_policy_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_api_policy"
+  script:
+    - !reference [.get_api_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_api_policy_dev:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
+      when: manual
+  script:
+    - !reference [.set_api_policy, script]
+
+clear_api_policy_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
+      when: manual
+  script:
+    - !reference [.clear_api_policy, script]
+
+get_operation_policy_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_operation_policy"
+  script:
+    - !reference [.get_operation_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_operation_policy_dev:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
+      when: manual
+  script:
+    - !reference [.set_operation_policy, script]
+
+clear_operation_policy_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
+      when: manual
+  script:
+    - !reference [.clear_operation_policy, script]
+
+# ============================================
+# Deploy Jobs - Test Environment
+# ============================================
+import_api_tst:
+  extends: .deploy_base_with_spec
+  needs: ["validate_inputs", "validate_spec", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
+      when: manual
+  script:
+    - !reference [.import_api, script]
+
+delete_api_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_api", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
+      when: manual
+  script:
+    - !reference [.delete_api, script]
+
+get_api_policy_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_api_policy"
+  script:
+    - !reference [.get_api_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_api_policy_tst:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
+      when: manual
+  script:
+    - !reference [.set_api_policy, script]
+
+clear_api_policy_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
+      when: manual
+  script:
+    - !reference [.clear_api_policy, script]
+
+get_operation_policy_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_operation_policy"
+  script:
+    - !reference [.get_operation_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_operation_policy_tst:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
+      when: manual
+  script:
+    - !reference [.set_operation_policy, script]
+
+clear_operation_policy_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
+      when: manual
+  script:
+    - !reference [.clear_operation_policy, script]
+
+# ============================================
+# Deploy Jobs - Staging Environment
+# ============================================
+import_api_stg:
+  extends: .deploy_base_with_spec
+  needs: ["validate_inputs", "validate_spec", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
+      when: manual
+  script:
+    - !reference [.import_api, script]
+
+delete_api_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_api", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
+      when: manual
+  script:
+    - !reference [.delete_api, script]
+
+get_api_policy_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_api_policy"
+  script:
+    - !reference [.get_api_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_api_policy_stg:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
+      when: manual
+  script:
+    - !reference [.set_api_policy, script]
+
+clear_api_policy_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
+      when: manual
+  script:
+    - !reference [.clear_api_policy, script]
+
+get_operation_policy_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_operation_policy"
+  script:
+    - !reference [.get_operation_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_operation_policy_stg:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
+      when: manual
+  script:
+    - !reference [.set_operation_policy, script]
+
+clear_operation_policy_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
+      when: manual
+  script:
+    - !reference [.clear_operation_policy, script]
+
+# ============================================
+# Deploy Jobs - Production Environment
+# ============================================
+import_api_prd:
+  extends: .deploy_base_with_spec
+  needs: ["validate_inputs", "validate_spec", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
+      when: manual
+  script:
+    - !reference [.import_api, script]
+
+delete_api_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_api", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
+      when: manual
+  script:
+    - !reference [.delete_api, script]
+
+get_api_policy_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_api_policy"
+  script:
+    - !reference [.get_api_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_api_policy_prd:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
+      when: manual
+  script:
+    - !reference [.set_api_policy, script]
+
+clear_api_policy_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
+      when: manual
+  script:
+    - !reference [.clear_api_policy, script]
+
+get_operation_policy_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_operation_policy"
+  script:
+    - !reference [.get_operation_policy, script]
+  artifacts:
+    paths:
+      - policy-output/
+    expire_in: 30 days
+    when: always
+
+set_operation_policy_prd:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
+      when: manual
+  script:
+    - !reference [.set_operation_policy, script]
+
+clear_operation_policy_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
+      when: manual
+  script:
+    - !reference [.clear_operation_policy, script]

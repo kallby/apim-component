@@ -1,0 +1,1040 @@
+# ============================================
+# APIM Global Policy Component
+#
+# A reusable CI/CD component for managing the
+# global (service-level) policy in Azure API Management.
+#
+# Usage:
+#   include:
+#     - component: $CI_SERVER_FQDN/devops/components/api-management/apim-global-policy@1.0.0
+#
+# Then run the pipeline and fill in the variables in the UI.
+#
+# Note: Policy XML files should be stored in the same project
+# that uses this component (not in a separate repository).
+#
+# ============================================
+# Required CI/CD Variables (set in consuming project):
+#
+# Azure - Shared:
+#   AZ_TENANT_ID
+#
+# Azure - Per environment (DEV, TST, STG, PRD):
+#   {ENV}_AZ_SPN_CLIENT_ID
+#   {ENV}_AZ_SPN_CLIENT_SECRET
+#   {ENV}_AZ_SUBSCRIPTION_ID
+#   {ENV}_RESOURCE_GROUP
+#   {ENV}_APIM_SERVICE
+# ============================================
+
+spec:
+  inputs: {}
+
+---
+
+# ============================================
+# Pipeline Variables (shown in Run Pipeline UI)
+# ============================================
+variables:
+  # -----------------------------------------------
+  # Container Images (self-hosted in GitLab registry)
+  # Change these to point to your internal registry
+  # -----------------------------------------------
+  IMAGE_AZURE_CLI: "${CI_REGISTRY}/devops/images/azure-cli:latest"
+  IMAGE_PYTHON: "${CI_REGISTRY}/devops/images/python:3.11-slim"
+  IMAGE_ALPINE: "${CI_REGISTRY}/devops/images/alpine:latest"
+
+  # Internal variables
+  AZURE_API_VERSION: "2022-08-01"
+
+  # -----------------------------------------------
+  # User-provided variables (shown in Run Pipeline UI)
+  # -----------------------------------------------
+  OPERATION:
+    value: "get_global_policy"
+    description: "Operation to perform"
+    options:
+      - "get_global_policy"
+      - "set_global_policy"
+      - "clear_global_policy"
+
+  POLICY_FILE_PATH:
+    value: ""
+    description: "Path to policy XML file in this project (e.g., 'policies/global-policy.xml')"
+
+# ============================================
+# Default Configuration
+# ============================================
+default:
+  timeout: 30 minutes
+  interruptible: true
+
+stages:
+  - list
+  - validate
+  - backup
+  - plan
+  - notify
+  - deploy
+
+# ============================================
+# YAML Anchors - Reusable Script Blocks
+# ============================================
+
+.logging_functions: &logging_functions
+  - |
+    log_info()  { echo "[INFO]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_warn()  { echo "[WARN]  $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+    log_error() { echo "[ERROR] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >&2; }
+    log_ok()    { echo "[OK]    $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+# ============================================
+# Audit Functions
+# ============================================
+.audit_functions: &audit_functions
+  - |
+    AUDIT_LOG_FILE="${CI_PROJECT_DIR}/audit-${CI_PIPELINE_ID}.json"
+
+    # Initialize audit log as empty JSON array if it doesn't exist
+    if [ ! -f "$AUDIT_LOG_FILE" ]; then
+      echo "[]" > "$AUDIT_LOG_FILE"
+    fi
+
+    log_audit() {
+      local action="$1"
+      local resource="$2"
+      local details="${3:-}"
+
+      local audit_entry=$(jq -n \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg pipeline_id "${CI_PIPELINE_ID}" \
+        --arg job_id "${CI_JOB_ID}" \
+        --arg job_name "${CI_JOB_NAME}" \
+        --arg triggered_by "${GITLAB_USER_LOGIN:-unknown}" \
+        --arg action "${action}" \
+        --arg resource "${resource}" \
+        --arg environment "${ENV_NAME:-unknown}" \
+        --arg apim_service "${APIM_SERVICE:-unknown}" \
+        --arg details "${details}" \
+        --arg branch "${CI_COMMIT_BRANCH}" \
+        --arg commit_sha "${CI_COMMIT_SHA}" \
+        '{
+          timestamp: $timestamp,
+          pipeline_id: $pipeline_id,
+          job_id: $job_id,
+          job_name: $job_name,
+          triggered_by: $triggered_by,
+          action: $action,
+          resource: $resource,
+          environment: $environment,
+          apim_service: $apim_service,
+          details: $details,
+          branch: $branch,
+          commit_sha: $commit_sha
+        }')
+
+      # Append entry to JSON array
+      jq --argjson entry "$audit_entry" '. += [$entry]' "$AUDIT_LOG_FILE" > "${AUDIT_LOG_FILE}.tmp" && mv "${AUDIT_LOG_FILE}.tmp" "$AUDIT_LOG_FILE"
+      log_info "AUDIT: action=$action resource=$resource"
+    }
+
+.set_environment: &set_environment
+  - |
+    case "$CI_COMMIT_BRANCH" in
+      dev|develop)
+        export ENV_NAME="dev"
+        export ENV_PREFIX="DEV"
+        ;;
+      tst|test)
+        export ENV_NAME="tst"
+        export ENV_PREFIX="TST"
+        ;;
+      stg|staging)
+        export ENV_NAME="stg"
+        export ENV_PREFIX="STG"
+        ;;
+      prd|main)
+        export ENV_NAME="prd"
+        export ENV_PREFIX="PRD"
+        ;;
+      *)
+        log_error "Unknown branch '$CI_COMMIT_BRANCH'. Valid: dev, develop, tst, test, stg, staging, prd, main"
+        exit 1
+        ;;
+    esac
+
+    # Dynamically set credentials based on environment prefix
+    eval "export AZ_SPN_CLIENT_ID=\${${ENV_PREFIX}_AZ_SPN_CLIENT_ID}"
+    eval "export AZ_SPN_CLIENT_SECRET=\${${ENV_PREFIX}_AZ_SPN_CLIENT_SECRET}"
+    eval "export AZ_SUBSCRIPTION_ID=\${${ENV_PREFIX}_AZ_SUBSCRIPTION_ID}"
+    eval "export RESOURCE_GROUP=\${${ENV_PREFIX}_RESOURCE_GROUP}"
+    eval "export APIM_SERVICE=\${${ENV_PREFIX}_APIM_SERVICE}"
+
+    # Validate required credentials
+    MISSING_VARS=""
+    [ -z "$AZ_SPN_CLIENT_ID" ] && MISSING_VARS="$MISSING_VARS ${ENV_PREFIX}_AZ_SPN_CLIENT_ID"
+    [ -z "$AZ_SPN_CLIENT_SECRET" ] && MISSING_VARS="$MISSING_VARS ${ENV_PREFIX}_AZ_SPN_CLIENT_SECRET"
+    [ -z "$AZ_TENANT_ID" ] && MISSING_VARS="$MISSING_VARS AZ_TENANT_ID"
+    [ -z "$AZ_SUBSCRIPTION_ID" ] && MISSING_VARS="$MISSING_VARS ${ENV_PREFIX}_AZ_SUBSCRIPTION_ID"
+    [ -z "$RESOURCE_GROUP" ] && MISSING_VARS="$MISSING_VARS ${ENV_PREFIX}_RESOURCE_GROUP"
+    [ -z "$APIM_SERVICE" ] && MISSING_VARS="$MISSING_VARS ${ENV_PREFIX}_APIM_SERVICE"
+
+    if [ -n "$MISSING_VARS" ]; then
+      log_error "Missing CI/CD variables for $ENV_NAME environment:"
+      echo "$MISSING_VARS"
+      exit 1
+    fi
+
+    log_info "Environment: $ENV_NAME | APIM: $APIM_SERVICE"
+
+.azure_login: &azure_login
+  - |
+    log_info "Authenticating to Azure..."
+    set +x
+    if ! az login --service-principal \
+      -u "$AZ_SPN_CLIENT_ID" \
+      -p "$AZ_SPN_CLIENT_SECRET" \
+      --tenant "$AZ_TENANT_ID" \
+      --output none 2>/dev/null; then
+      log_error "Azure authentication failed"
+      exit 1
+    fi
+    set -x
+    az account set --subscription "$AZ_SUBSCRIPTION_ID"
+    log_ok "Authenticated to Azure"
+
+.build_api_urls: &build_api_urls
+  - |
+    export APIM_BASE_URL="https://management.azure.com/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}"
+    export GLOBAL_POLICY_URL="${APIM_BASE_URL}/policies/policy?api-version=${AZURE_API_VERSION}"
+
+# ============================================
+# Stage: List (read-only operations)
+# ============================================
+get_global_policy:
+  stage: list
+  image: $IMAGE_AZURE_CLI
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_global_policy"
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Global Policy for $APIM_SERVICE"
+      log_info "=========================================="
+
+      # Try to get policy - don't fail if it doesn't exist
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$GLOBAL_POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1) || true
+
+      if echo "$HTTP_RESPONSE" | jq -e '.properties.value' > /dev/null 2>&1; then
+        log_ok "Global policy retrieved"
+        echo ""
+        echo "Policy Content:"
+        echo "=========================================="
+        echo "$HTTP_RESPONSE" | jq -r '.properties.value'
+        echo "=========================================="
+      elif echo "$HTTP_RESPONSE" | grep -q "PolicyNotFound\|ResourceNotFound\|NotFound"; then
+        log_info "No global policy is currently configured for this APIM instance"
+        echo ""
+        echo "=========================================="
+        echo "Status: No policy configured"
+        echo "=========================================="
+        echo ""
+        echo "To set a global policy, run this pipeline with:"
+        echo "  OPERATION: set_global_policy"
+        echo "  POLICY_FILE_PATH: path/to/your/policy.xml"
+      else
+        log_warn "Could not retrieve global policy"
+        echo ""
+        echo "Response:"
+        echo "$HTTP_RESPONSE"
+      fi
+
+# ============================================
+# Stage: Validate
+# ============================================
+validate_inputs:
+  stage: validate
+  image: $IMAGE_ALPINE
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^get_/
+  script:
+    - *logging_functions
+    - |
+      log_info "=========================================="
+      log_info "Validating Pipeline Inputs"
+      log_info "=========================================="
+      echo "Operation: $OPERATION"
+      echo "Branch: $CI_COMMIT_BRANCH"
+      echo ""
+
+      case "$OPERATION" in
+        set_global_policy)
+          if [ -z "$POLICY_FILE_PATH" ]; then
+            log_error "POLICY_FILE_PATH is required for set_global_policy"
+            exit 1
+          fi
+          log_ok "POLICY_FILE_PATH: $POLICY_FILE_PATH"
+          ;;
+        clear_global_policy)
+          log_ok "No additional inputs required for clear_global_policy"
+          ;;
+        *)
+          log_error "Invalid operation: $OPERATION"
+          exit 1
+          ;;
+      esac
+
+      log_ok "All inputs validated successfully"
+
+validate_policy:
+  stage: validate
+  image: $IMAGE_ALPINE
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_global_policy"
+  before_script:
+    - apk add --no-cache libxml2-utils
+    - *logging_functions
+  script:
+    - |
+      log_info "Validating policy file: $POLICY_FILE_PATH (from branch: $CI_COMMIT_BRANCH)"
+
+      FULL_PATH="${CI_PROJECT_DIR}/${POLICY_FILE_PATH}"
+
+      if [ ! -f "$FULL_PATH" ]; then
+        log_error "Policy file not found: $POLICY_FILE_PATH"
+        echo ""
+        echo "Available policy files in project:"
+        find "${CI_PROJECT_DIR}" -name "*.xml" -type f | sed "s|${CI_PROJECT_DIR}/||g" | head -20
+        exit 1
+      fi
+
+      log_ok "Policy file found"
+
+      # Validate XML syntax
+      if ! xmllint --noout "$FULL_PATH" 2>&1; then
+        log_error "Policy XML is not well-formed"
+        exit 1
+      fi
+
+      log_ok "XML syntax is valid"
+
+      # Check for required policy structure
+      if ! grep -q "<policies>" "$FULL_PATH"; then
+        log_error "Policy file must contain <policies> root element"
+        exit 1
+      fi
+
+      log_ok "Policy structure validated"
+
+# ============================================
+# Stage: Backup
+# ============================================
+backup_global_policy:
+  stage: backup
+  image: $IMAGE_AZURE_CLI
+  needs: ["validate_inputs"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_|clear_)/
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "Creating backup of current global policy..."
+
+      BACKUP_DIR="backup-${CI_PIPELINE_ID}"
+      mkdir -p "$BACKUP_DIR"
+
+      BACKUP_FILE="$BACKUP_DIR/global-policy.xml"
+
+      # Try to get current policy using --output-file (Azure's recommended approach for XML)
+      if az rest --method GET \
+        --url "$GLOBAL_POLICY_URL" \
+        --output-file "$BACKUP_FILE" 2>/dev/null; then
+        
+        # Check if we got actual policy content or an error message
+        if grep -q "<policies>" "$BACKUP_FILE"; then
+          log_ok "Global policy backed up successfully"
+          POLICY_EXISTED="true"
+          echo "BACKUP_STATUS=exists" >> "$BACKUP_DIR/metadata.json"
+        else
+          log_warn "Retrieved file doesn't contain valid policy"
+          echo "<!-- Could not retrieve policy -->" > "$BACKUP_FILE"
+          POLICY_EXISTED="false"
+          echo "BACKUP_STATUS=unknown" >> "$BACKUP_DIR/metadata.json"
+        fi
+      else
+        # Command failed - likely no policy exists
+        log_info "No global policy currently configured - skipping backup"
+        echo "" > "$BACKUP_FILE"
+        POLICY_EXISTED="false"
+        echo "BACKUP_STATUS=no_policy" >> "$BACKUP_DIR/metadata.json"
+      fi
+
+      # Save metadata
+      cat > "$BACKUP_DIR/metadata.json" << EOF
+      {
+        "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "pipeline_id": "${CI_PIPELINE_ID}",
+        "user": "${GITLAB_USER_EMAIL}",
+        "operation": "${OPERATION}",
+        "environment": "${ENV_NAME}",
+        "policy_existed": ${POLICY_EXISTED}
+      }
+      EOF
+
+      log_ok "Backup stage completed"
+  artifacts:
+    paths:
+      - backup-*/
+    expire_in: 7 days
+
+# ============================================
+# Stage: Plan
+# ============================================
+plan:
+  stage: plan
+  image: $IMAGE_AZURE_CLI
+  needs:
+    - job: validate_inputs
+      optional: true
+    - job: validate_policy
+      optional: true
+    - job: backup_global_policy
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION !~ /^get_/
+  before_script:
+    - *logging_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Execution Plan"
+      log_info "=========================================="
+      echo ""
+      echo "Operation:    $OPERATION"
+      echo "Environment:  $ENV_NAME"
+      echo "APIM Service: $APIM_SERVICE"
+      echo ""
+
+      # Show current policy state - don't fail if no policy exists
+      HTTP_RESPONSE=$(az rest --method GET \
+        --url "$GLOBAL_POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output json 2>&1) || true
+
+      echo "Current Global Policy:"
+      echo "----------------------------------------"
+      if echo "$HTTP_RESPONSE" | jq -e '.properties.value' > /dev/null 2>&1; then
+        echo "$HTTP_RESPONSE" | jq -r '.properties.value' | head -20
+        LINES=$(echo "$HTTP_RESPONSE" | jq -r '.properties.value' | wc -l)
+        [ "$LINES" -gt 20 ] && echo "... (truncated, $LINES total lines)"
+      elif echo "$HTTP_RESPONSE" | grep -q "PolicyNotFound\|ResourceNotFound\|NotFound"; then
+        echo "(no policy currently configured)"
+      else
+        echo "(unable to retrieve current policy)"
+      fi
+      echo "----------------------------------------"
+
+      case "$OPERATION" in
+        set_global_policy)
+          echo ""
+          echo "Action: SET global policy"
+          echo "Policy File: $POLICY_FILE_PATH"
+          ;;
+        clear_global_policy)
+          echo ""
+          echo "Action: CLEAR global policy (reset to default)"
+          echo ""
+          echo "WARNING: This will remove the global policy!"
+          ;;
+      esac
+
+      echo ""
+      log_info "Plan complete. Approve deploy job to execute."
+
+# ============================================
+# Stage: Notify (send approval notification emails)
+# ============================================
+notify_approvers:
+  stage: notify
+  image: $IMAGE_PYTHON
+  needs: ["plan"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_global_policy|clear_global_policy)$/
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  cache:
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install --quiet requests
+    # Set APIM_SERVICE based on branch (for email notification)
+    - |
+      case "$CI_COMMIT_BRANCH" in
+        dev|develop) export APIM_SERVICE="$DEV_APIM_SERVICE" ;;
+        tst|test) export APIM_SERVICE="$TST_APIM_SERVICE" ;;
+        stg|staging) export APIM_SERVICE="$STG_APIM_SERVICE" ;;
+        prd|main) export APIM_SERVICE="$PRD_APIM_SERVICE" ;;
+      esac
+  script:
+    - |
+      cat > /tmp/notify_approvers.py << 'PYTHON_SCRIPT'
+      #!/usr/bin/env python3
+      """Send approval notification emails to protected environment approvers."""
+
+      import os
+      import sys
+      import smtplib
+      from email.mime.text import MIMEText
+      from email.mime.multipart import MIMEMultipart
+      from email.utils import formataddr
+      from datetime import datetime, timezone, timedelta
+
+      try:
+          import requests
+      except ImportError:
+          print("[ERROR] requests library not installed")
+          sys.exit(1)
+
+      def log_info(msg): print(f"[INFO]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_warn(msg): print(f"[WARN]  {datetime.utcnow().isoformat()}Z - {msg}")
+      def log_error(msg): print(f"[ERROR] {datetime.utcnow().isoformat()}Z - {msg}", file=sys.stderr)
+
+      class GitLabClient:
+          def __init__(self, url, token):
+              self.api_url = f"{url.rstrip('/')}/api/v4"
+              self.headers = {'PRIVATE-TOKEN': token}
+
+          def get(self, endpoint):
+              r = requests.get(f"{self.api_url}/{endpoint}", headers=self.headers, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          def get_protected_env(self, project_id, env_name):
+              return self.get(f"projects/{project_id}/protected_environments/{env_name}")
+
+          def get_user(self, user_id):
+              return self.get(f"users/{user_id}")
+
+          def get_group_members(self, group_id):
+              members = []
+              page = 1
+              while True:
+                  result = self.get(f"groups/{group_id}/members/all?page={page}&per_page=100")
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+              return members
+
+          def get_project_members(self, project_id, min_access_level=None):
+              """Get project members, optionally filtered by minimum access level."""
+              members = []
+              page = 1
+              endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+              if min_access_level:
+                  endpoint += f"&min_access_level={min_access_level}"
+              while True:
+                  result = self.get(endpoint)
+                  if not result: break
+                  members.extend(result)
+                  if len(result) < 100: break
+                  page += 1
+                  endpoint = f"projects/{project_id}/members/all?page={page}&per_page=100"
+                  if min_access_level:
+                      endpoint += f"&min_access_level={min_access_level}"
+              return members
+
+      # GitLab access levels
+      ACCESS_LEVEL_DEVELOPER = 30
+      ACCESS_LEVEL_MAINTAINER = 40
+
+      def get_env_from_branch(branch):
+          return {'dev': 'dev', 'develop': 'dev', 'tst': 'tst', 'test': 'tst',
+                  'stg': 'stg', 'staging': 'stg', 'prd': 'prd', 'main': 'prd'}.get(branch, 'dev')
+
+      def get_excluded_emails():
+          """Get list of emails to exclude from notifications (from SMTP_EXCLUDE_EMAILS env var)."""
+          exclude_str = os.environ.get('SMTP_EXCLUDE_EMAILS', '')
+          if not exclude_str:
+              return []
+          return [e.strip().lower() for e in exclude_str.split(',') if e.strip()]
+
+      def is_excluded_email(email):
+          """Check if email should be excluded from notifications."""
+          if not email:
+              return True
+          email_lower = email.lower()
+          # Exclude service account emails (group_*@lazard.com) by default
+          if email_lower.startswith('group_'):
+              return True
+          # Check additional exclusions from SMTP_EXCLUDE_EMAILS
+          excluded = get_excluded_emails()
+          return email_lower in excluded
+
+      def get_user_email(user, email_domain=None):
+          """
+          Try to get user email from various fields.
+          GitLab API email visibility:
+            - 'email': Only visible to admins
+            - 'public_email': Only if user sets it in Profile settings
+            - 'commit_email': User's commit email (may be private)
+          Falls back to constructing email from username if domain provided.
+          """
+          # Try standard email fields
+          email = user.get('email') or user.get('public_email') or user.get('commit_email')
+
+          # Filter out GitLab's private commit email format
+          if email and '@users.noreply' in email:
+              email = None
+
+          # Fallback: construct from username + domain
+          if not email and email_domain:
+              username = user.get('username')
+              if username:
+                  email = f"{username}@{email_domain}"
+
+          return email
+
+      def collect_approvers(gl, project_id, env_name, email_domain=None):
+          approvers = {}
+          try:
+              env_config = gl.get_protected_env(project_id, env_name)
+          except Exception as e:
+              log_warn(f"Could not get protected environment: {e}")
+              return approvers
+
+          # Debug: show what we got from the API
+          log_info(f"Protected environment config keys: {list(env_config.keys())}")
+
+          # Only use approval_rules (not deploy_access_levels)
+          approval_rules = env_config.get('approval_rules', [])
+          log_info(f"Found {len(approval_rules)} approval_rules")
+
+          if not approval_rules:
+              log_warn("No approval_rules found in protected environment")
+              log_warn("Add approvers in Settings > CI/CD > Protected Environments > [env] > Approvers")
+              return approvers
+
+          for access in approval_rules:
+              user_id = access.get('user_id')
+              group_id = access.get('group_id')
+              access_level = access.get('access_level')
+
+              log_info(f"Processing approval rule: user_id={user_id}, group_id={group_id}, access_level={access_level}")
+
+              if user_id:
+                  # Specific user approver
+                  try:
+                      user = gl.get_user(user_id)
+                      email = get_user_email(user, email_domain)
+                      log_info(f"User {user_id} ({user.get('username')}): resolved email={email}")
+                      if email and not is_excluded_email(email):
+                          approvers[email] = user.get('name', 'Unknown')
+                      elif not email:
+                          log_warn(f"User {user_id} ({user.get('name')}, @{user.get('username')}) - no email found")
+                          log_warn(f"  User should set public email in GitLab Profile, or set EMAIL_DOMAIN variable")
+                  except Exception as e:
+                      log_warn(f"Could not get user {user_id}: {e}")
+              elif group_id:
+                  # Group approvers - include all members of the group
+                  try:
+                      members = gl.get_group_members(group_id)
+                      log_info(f"Approver group {group_id} has {len(members)} members")
+                      for member in members:
+                          email = get_user_email(member, email_domain)
+                          if email and not is_excluded_email(email):
+                              approvers[email] = member.get('name', 'Unknown')
+                          elif not email:
+                              log_warn(f"Group member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get group {group_id} members: {e}")
+              elif access_level:
+                  # Role-based approvers (e.g., all maintainers)
+                  try:
+                      members = gl.get_project_members(project_id, min_access_level=access_level)
+                      log_info(f"Found {len(members)} project members with access_level >= {access_level}")
+                      for member in members:
+                          if member.get('access_level', 0) >= access_level:
+                              email = get_user_email(member, email_domain)
+                              if email and not is_excluded_email(email):
+                                  approvers[email] = member.get('name', 'Unknown')
+                              elif not email:
+                                  log_warn(f"Project member @{member.get('username')} ({member.get('name')}) - no email found")
+                  except Exception as e:
+                      log_warn(f"Could not get project members for access_level {access_level}: {e}")
+
+          return approvers
+
+      def get_fallback_approvers():
+          """Get approvers from APPROVER_EMAILS environment variable."""
+          approver_emails = os.environ.get('APPROVER_EMAILS', '')
+          if not approver_emails:
+              return {}
+          approvers = {}
+          for email in approver_emails.split(','):
+              email = email.strip()
+              if email:
+                  # Use email prefix as name if no name provided
+                  name = email.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+                  approvers[email] = name
+          return approvers
+
+      def build_file_url(repo_url, branch, file_path):
+          if not repo_url or not file_path: return None
+          return f"{repo_url.rstrip('/').rstrip('.git')}/-/blob/{branch}/{file_path}"
+
+      def send_email(smtp_host, smtp_port, from_addr, from_name, to_emails, subject, html, text):
+          msg = MIMEMultipart('alternative')
+          msg['Subject'] = subject
+          msg['From'] = formataddr((from_name, from_addr)) if from_name else from_addr
+          msg['To'] = ', '.join(to_emails)
+          msg.attach(MIMEText(text, 'plain'))
+          msg.attach(MIMEText(html, 'html'))
+
+          try:
+              with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                  server.sendmail(from_addr, to_emails, msg.as_string())
+              return True
+          except Exception as e:
+              log_error(f"SMTP error: {e}")
+              return False
+
+      def main():
+          gitlab_url = os.environ.get('GITLAB_URL') or os.environ.get('CI_SERVER_URL')
+          gitlab_token = os.environ.get('GITLAB_TOKEN')
+          smtp_host = os.environ.get('SMTP_HOST')
+          smtp_from = os.environ.get('SMTP_FROM')
+          smtp_from_name = os.environ.get('SMTP_FROM_NAME', '')
+          smtp_port = int(os.environ.get('SMTP_PORT', '25'))
+          approver_emails_fallback = os.environ.get('APPROVER_EMAILS', '')
+
+          # Check minimum requirements
+          if not smtp_host or not smtp_from:
+              log_warn("Missing SMTP_HOST or SMTP_FROM - skipping notification")
+              return
+
+          if not gitlab_token and not approver_emails_fallback:
+              log_warn("Missing both GITLAB_TOKEN and APPROVER_EMAILS - skipping notification")
+              log_warn("Set GITLAB_TOKEN (with read_api scope, Maintainer access) or APPROVER_EMAILS")
+              return
+
+          project_id = os.environ.get('CI_PROJECT_ID')
+          branch = os.environ.get('CI_COMMIT_BRANCH', 'main')
+          env_name = get_env_from_branch(branch)
+
+          approvers = {}
+
+          # EMAIL_DOMAIN allows constructing email from username (default: lazard.com)
+          email_domain = os.environ.get('EMAIL_DOMAIN', 'lazard.com')
+          log_info(f"Email domain: {email_domain} (emails constructed as username@{email_domain})")
+
+          # Try to get approvers from GitLab API first
+          if gitlab_token and gitlab_url:
+              log_info(f"Collecting approvers for environment: {env_name}")
+              gl = GitLabClient(gitlab_url, gitlab_token)
+              approvers = collect_approvers(gl, project_id, env_name, email_domain or None)
+
+          # Fallback to APPROVER_EMAILS if API failed or returned no approvers
+          if not approvers and approver_emails_fallback:
+              log_info("Using APPROVER_EMAILS fallback")
+              approvers = get_fallback_approvers()
+
+          if not approvers:
+              log_warn("No approvers found - skipping notification")
+              log_warn("Either fix GITLAB_TOKEN permissions or set APPROVER_EMAILS variable")
+              return
+
+          log_info(f"Found {len(approvers)} approvers")
+
+          # Build context
+          operation = os.environ.get('OPERATION', 'Unknown')
+          pipeline_url = os.environ.get('CI_PIPELINE_URL', '')
+          project_name = os.environ.get('CI_PROJECT_NAME', 'APIM')
+          triggered_by = os.environ.get('GITLAB_USER_NAME', 'Unknown')
+          policy_file = os.environ.get('POLICY_FILE_PATH', '')
+          lob = os.environ.get('CI_PROJECT_ROOT_NAMESPACE', 'Unknown')
+          apim_instance = os.environ.get('APIM_SERVICE', 'Unknown')
+
+          # Timestamp in Eastern Time (New York)
+          eastern = timezone(timedelta(hours=-5))  # EST (adjust for DST if needed)
+          now_eastern = datetime.now(eastern)
+          timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+          # Risk indicator for destructive operations
+          destructive_ops = ['clear_global_policy']
+          is_destructive = operation in destructive_ops
+
+          # Build URL to policy file in the project (not a separate repo)
+          project_url = os.environ.get('CI_PROJECT_URL', '')
+          branch = os.environ.get('CI_COMMIT_BRANCH', 'main')
+          policy_url = f"{project_url}/-/blob/{branch}/{policy_file}" if project_url and policy_file else None
+
+          details = []
+          if policy_file:
+              link = f'<a href="{policy_url}">{policy_file}</a>' if policy_url else policy_file
+              details.append(f"<tr><td><b>Policy File:</b></td><td>{link}</td></tr>")
+
+          env_color = {'prd': '#dc3545', 'stg': '#fd7e14', 'tst': '#17a2b8', 'dev': '#28a745'}.get(env_name, '#6c757d')
+
+          risk_banner = '''<div style="background: #dc3545; color: white; padding: 12px 20px; margin-bottom: 15px; border-radius: 4px;">
+          <strong>⚠️ DESTRUCTIVE OPERATION</strong> - This action will permanently delete or clear resources. Please review carefully.
+          </div>''' if is_destructive else ''
+
+          html = f'''<!DOCTYPE html><html><head><style>
+          body {{ font-family: sans-serif; }}
+          .header {{ background: #1f75cb; color: white; padding: 20px; }}
+          .content {{ padding: 20px; background: #f5f5f5; }}
+          .details {{ background: white; padding: 15px; margin: 15px 0; }}
+          .details td {{ padding: 5px 10px; }}
+          .btn {{ background: #1f75cb; color: white; padding: 10px 20px; text-decoration: none; display: inline-block; }}
+          .env {{ background: {env_color}; color: white; padding: 2px 8px; font-size: 12px; }}
+          .lob {{ background: #6f42c1; color: white; padding: 2px 8px; font-size: 12px; }}
+          .risk {{ background: #dc3545; color: white; padding: 2px 8px; font-size: 12px; }}
+          .timestamp {{ color: #666; font-size: 12px; }}
+          </style></head><body>
+          <div class="header"><h2>Pipeline Approval Required</h2><span class="timestamp">Requested: {timestamp}</span></div>
+          <div class="content">
+          {risk_banner}
+          <p>A pipeline needs your approval to deploy to <span class="env">{env_name.upper()}</span></p>
+          <div class="details"><table>
+          <tr><td><b>LOB:</b></td><td><span class="lob">{lob.upper()}</span></td></tr>
+          <tr><td><b>APIM Instance:</b></td><td><code>{apim_instance}</code></td></tr>
+          <tr><td><b>Project:</b></td><td>{project_name}</td></tr>
+          <tr><td><b>Operation:</b></td><td><code>{operation}</code>{' <span class="risk">DESTRUCTIVE</span>' if is_destructive else ''}</td></tr>
+          <tr><td><b>Environment:</b></td><td>{env_name}</td></tr>
+          <tr><td><b>Triggered by:</b></td><td>{triggered_by}</td></tr>
+          <tr><td><b>Requested at:</b></td><td>{timestamp}</td></tr>
+          {''.join(details)}
+          </table></div>
+          <p><a href="{pipeline_url}" class="btn">Review Pipeline</a></p>
+          </div></body></html>'''
+
+          text = f'''PIPELINE APPROVAL REQUIRED
+          {"⚠️  DESTRUCTIVE OPERATION - This action will permanently delete or clear resources!" if is_destructive else ""}
+
+          LOB: {lob.upper()}
+          APIM Instance: {apim_instance}
+          Project: {project_name}
+          Operation: {operation} {"[DESTRUCTIVE]" if is_destructive else ""}
+          Environment: {env_name}
+          Triggered by: {triggered_by}
+          Requested at: {timestamp}
+          {"Policy File: " + policy_file if policy_file else ""}
+
+          Review: {pipeline_url}'''
+
+          lob_prefix = f"[{lob.upper()}]" if lob and lob != 'Unknown' else "[APIM]"
+          env_label = "PRODUCTION" if env_name == 'prd' else env_name.upper()
+          subject = f"{lob_prefix} [{env_label}] Approval Required: {operation}"
+
+          if send_email(smtp_host, smtp_port, smtp_from, smtp_from_name, list(approvers.keys()), subject, html, text):  
+              log_info("Notification emails sent successfully")
+              for email, name in approvers.items():
+                  log_info(f"  - {name} <{email}>")
+          else:
+              log_error("Failed to send notification emails")
+
+      if __name__ == '__main__':
+          main()
+      PYTHON_SCRIPT
+
+      python /tmp/notify_approvers.py
+  allow_failure: true  # Don't block pipeline if notification fails
+
+# ============================================
+# Deploy Base Templates
+# ============================================
+.deploy_base:
+  stage: deploy
+  image: $IMAGE_AZURE_CLI
+  timeout: 15 minutes
+  before_script:
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  artifacts:
+    paths:
+      - audit-*.json
+    expire_in: 30 days
+
+.deploy_base_with_policy:
+  stage: deploy
+  image: $IMAGE_AZURE_CLI
+  timeout: 15 minutes
+  before_script:
+    - *logging_functions
+    - *audit_functions
+    - *set_environment
+    - *azure_login
+    - *build_api_urls
+  artifacts:
+    paths:
+      - audit-*.json
+    expire_in: 30 days
+
+# ============================================
+# Reusable Operation Scripts
+# ============================================
+.set_global_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Setting Global Policy"
+      log_info "=========================================="
+
+      POLICY_CONTENT=$(cat "${CI_PROJECT_DIR}/${POLICY_FILE_PATH}")
+      log_info "Policy file: $POLICY_FILE_PATH (from branch: $CI_COMMIT_BRANCH)"
+
+      # Create request body with properly escaped JSON
+      REQUEST_BODY=$(jq -n --arg value "$POLICY_CONTENT" '{
+        "properties": {
+          "format": "xml",
+          "value": $value
+        }
+      }')
+
+      # Use --output none to avoid XML/JSON parsing issues, capture exit code
+      if az rest --method PUT \
+        --url "$GLOBAL_POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --body "$REQUEST_BODY" \
+        --output none 2>&1; then
+        log_ok "Global policy applied successfully"
+        log_audit "set_global_policy" "global" "policy_file=$POLICY_FILE_PATH"
+      else
+        log_error "Failed to set global policy"
+        exit 1
+      fi
+
+.clear_global_policy:
+  script:
+    - |
+      log_info "=========================================="
+      log_info "Clearing Global Policy"
+      log_info "=========================================="
+
+      az rest --method DELETE \
+        --url "$GLOBAL_POLICY_URL" \
+        --headers "Content-Type=application/json" \
+        --output none 2>&1 || true
+
+      log_ok "Global policy cleared"
+      log_audit "clear_global_policy" "global" "status=cleared"
+
+# ============================================
+# Deploy Jobs - Dev Environment
+# ============================================
+set_global_policy_dev:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_global_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_global_policy"
+      when: manual
+  script:
+    - !reference [.set_global_policy, script]
+
+clear_global_policy_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_global_policy", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_global_policy"
+      when: manual
+  script:
+    - !reference [.clear_global_policy, script]
+
+# ============================================
+# Deploy Jobs - Test Environment
+# ============================================
+set_global_policy_tst:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_global_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_global_policy"
+      when: manual
+  script:
+    - !reference [.set_global_policy, script]
+
+clear_global_policy_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_global_policy", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_global_policy"
+      when: manual
+  script:
+    - !reference [.clear_global_policy, script]
+
+# ============================================
+# Deploy Jobs - Staging Environment
+# ============================================
+set_global_policy_stg:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_global_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_global_policy"
+      when: manual
+  script:
+    - !reference [.set_global_policy, script]
+
+clear_global_policy_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_global_policy", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_global_policy"
+      when: manual
+  script:
+    - !reference [.clear_global_policy, script]
+
+# ============================================
+# Deploy Jobs - Production Environment
+# ============================================
+set_global_policy_prd:
+  extends: .deploy_base_with_policy
+  needs: ["validate_inputs", "validate_policy", "backup_global_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_global_policy"
+      when: manual
+  script:
+    - !reference [.set_global_policy, script]
+
+clear_global_policy_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "backup_global_policy", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_global_policy"
+      when: manual
+  script:
+    - !reference [.clear_global_policy, script]
