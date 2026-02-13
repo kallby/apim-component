@@ -304,8 +304,30 @@ The component automatically selects the environment based on the branch:
 1. **Validate** - Validates inputs and policy files (if applicable)
 2. **Backup** - Creates backup of existing resources (for updates/deletes)
 3. **Plan** - Shows what will be changed
-4. **Notify** - Sends email to approvers (if configured)
-5. **Deploy** - Manual approval required, then executes the operation
+4. **Notify** - Sends email to approvers (for operations requiring approval)
+5. **Deploy** - Executes the operation (may require manual approval)
+
+## Approval & Notification Rules
+
+| Operation | dev/tst | stg/prd |
+|-----------|---------|---------|
+| `list_products` | Auto | Auto |
+| `get_product` | Auto | Auto |
+| `create_product` | Auto | Approval Required |
+| `update_product` | Auto | Approval Required |
+| `delete_product` | Auto | Approval Required |
+| `add_api_to_product` | Auto | Approval Required |
+| `remove_api_from_product` | Auto | Approval Required |
+| `set_product_policy` | Auto | Approval Required |
+| `clear_product_policy` | Auto | Approval Required |
+| `add_group_to_product` | Auto | Approval Required |
+| `remove_group_from_product` | Auto | Approval Required |
+| `create_product_subscription` | Approval Required | Approval Required |
+| `delete_product_subscription` | Approval Required | Approval Required |
+
+**Notifications:**
+- **dev/tst branches:** Email notifications are sent only for `create_product_subscription` and `delete_product_subscription` operations.
+- **stg/prd branches:** Email notifications are sent for all operations requiring approval.
 
 ## Audit Logging
 

@@ -1035,7 +1035,10 @@ notify_approvers:
   image: $IMAGE_PYTHON
   needs: ["plan"]
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product|create_product_subscription|delete_product_subscription)$/
+    # For dev/tst branches, only notify for subscription operations (which still require approval)
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop|tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product_subscription|delete_product_subscription)$/
+    # For stg/prd branches, notify for all deploy operations
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging|prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product|create_product_subscription|delete_product_subscription)$/
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   cache:
@@ -1979,7 +1982,6 @@ create_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product"
-      when: manual
   script:
     - !reference [.create_product, script]
 
@@ -1990,7 +1992,6 @@ update_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "update_product"
-      when: manual
   script:
     - !reference [.update_product, script]
 
@@ -2001,7 +2002,6 @@ delete_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product"
-      when: manual
   script:
     - !reference [.delete_product, script]
 
@@ -2012,7 +2012,6 @@ add_api_to_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "add_api_to_product"
-      when: manual
   script:
     - !reference [.add_api_to_product, script]
 
@@ -2023,7 +2022,6 @@ remove_api_from_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "remove_api_from_product"
-      when: manual
   script:
     - !reference [.remove_api_from_product, script]
 
@@ -2034,7 +2032,6 @@ set_product_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_product_policy"
-      when: manual
   script:
     - !reference [.set_product_policy, script]
 
@@ -2045,7 +2042,6 @@ clear_product_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_product_policy"
-      when: manual
   script:
     - !reference [.clear_product_policy, script]
 
@@ -2056,7 +2052,6 @@ add_group_to_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "add_group_to_product"
-      when: manual
   script:
     - !reference [.add_group_to_product, script]
 
@@ -2067,7 +2062,6 @@ remove_group_from_product_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "remove_group_from_product"
-      when: manual
   script:
     - !reference [.remove_group_from_product, script]
 
@@ -2103,7 +2097,6 @@ create_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product"
-      when: manual
   script:
     - !reference [.create_product, script]
 
@@ -2114,7 +2107,6 @@ update_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "update_product"
-      when: manual
   script:
     - !reference [.update_product, script]
 
@@ -2125,7 +2117,6 @@ delete_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product"
-      when: manual
   script:
     - !reference [.delete_product, script]
 
@@ -2136,7 +2127,6 @@ add_api_to_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "add_api_to_product"
-      when: manual
   script:
     - !reference [.add_api_to_product, script]
 
@@ -2147,7 +2137,6 @@ remove_api_from_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "remove_api_from_product"
-      when: manual
   script:
     - !reference [.remove_api_from_product, script]
 
@@ -2158,7 +2147,6 @@ set_product_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_product_policy"
-      when: manual
   script:
     - !reference [.set_product_policy, script]
 
@@ -2169,7 +2157,6 @@ clear_product_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_product_policy"
-      when: manual
   script:
     - !reference [.clear_product_policy, script]
 
@@ -2180,7 +2167,6 @@ add_group_to_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "add_group_to_product"
-      when: manual
   script:
     - !reference [.add_group_to_product, script]
 
@@ -2191,7 +2177,6 @@ remove_group_from_product_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "remove_group_from_product"
-      when: manual
   script:
     - !reference [.remove_group_from_product, script]
 

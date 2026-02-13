@@ -377,8 +377,25 @@ The component automatically selects the environment based on the branch:
 1. **Validate** - Validates inputs and spec/policy files
 2. **Backup** - Creates backup of existing resources (for deletes/policy changes)
 3. **Plan** - Shows what will be changed
-4. **Notify** - Sends email to approvers (if configured)
-5. **Deploy** - Manual approval required, then executes the operation
+4. **Notify** - Sends email to approvers (for operations requiring approval)
+5. **Deploy** - Executes the operation (may require manual approval)
+
+## Approval & Notification Rules
+
+| Operation | dev/tst | stg/prd |
+|-----------|---------|---------|
+| `list_apis` | Auto | Auto |
+| `list_operations` | Auto | Auto |
+| `import_api` | Auto | Approval Required |
+| `delete_api` | Auto | Approval Required |
+| `get_api_policy` | Auto | Auto |
+| `set_api_policy` | Auto | Approval Required |
+| `clear_api_policy` | Auto | Approval Required |
+| `get_operation_policy` | Auto | Auto |
+| `set_operation_policy` | Auto | Approval Required |
+| `clear_operation_policy` | Auto | Approval Required |
+
+**Notifications:** Email notifications are sent to approvers only for operations requiring approval on stg/prd branches. No notifications are sent for dev/tst branches.
 
 ## Subscription Key Header
 

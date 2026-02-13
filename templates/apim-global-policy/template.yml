@@ -216,6 +216,7 @@ get_global_policy:
   image: $IMAGE_AZURE_CLI
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "get_global_policy"
+      when: manual
   before_script:
     - *logging_functions
     - *set_environment
@@ -475,7 +476,7 @@ notify_approvers:
   image: $IMAGE_PYTHON
   needs: ["plan"]
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(set_global_policy|clear_global_policy)$/
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(get_global_policy|set_global_policy|clear_global_policy)$/
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   cache:

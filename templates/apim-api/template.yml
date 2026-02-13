@@ -896,6 +896,9 @@ notify_approvers:
   image: $IMAGE_PYTHON
   needs: ["plan"]
   rules:
+    # Skip notifications for dev and tst branches (no approval required)
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop|tst|test)$/
+      when: never
     - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(import_api|delete_api|set_api_policy|clear_api_policy|set_operation_policy|clear_operation_policy)$/
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
@@ -2510,7 +2513,6 @@ import_api_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
-      when: manual
   script:
     - !reference [.import_api, script]
 
@@ -2521,7 +2523,6 @@ delete_api_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
-      when: manual
   script:
     - !reference [.delete_api, script]
 
@@ -2545,7 +2546,6 @@ set_api_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
-      when: manual
   script:
     - !reference [.set_api_policy, script]
 
@@ -2556,7 +2556,6 @@ clear_api_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
-      when: manual
   script:
     - !reference [.clear_api_policy, script]
 
@@ -2580,7 +2579,6 @@ set_operation_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
-      when: manual
   script:
     - !reference [.set_operation_policy, script]
 
@@ -2591,7 +2589,6 @@ clear_operation_policy_dev:
     name: dev
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
-      when: manual
   script:
     - !reference [.clear_operation_policy, script]
 
@@ -2605,7 +2602,6 @@ import_api_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "import_api"
-      when: manual
   script:
     - !reference [.import_api, script]
 
@@ -2616,7 +2612,6 @@ delete_api_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_api"
-      when: manual
   script:
     - !reference [.delete_api, script]
 
@@ -2640,7 +2635,6 @@ set_api_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_api_policy"
-      when: manual
   script:
     - !reference [.set_api_policy, script]
 
@@ -2651,7 +2645,6 @@ clear_api_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_api_policy"
-      when: manual
   script:
     - !reference [.clear_api_policy, script]
 
@@ -2675,7 +2668,6 @@ set_operation_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "set_operation_policy"
-      when: manual
   script:
     - !reference [.set_operation_policy, script]
 
@@ -2686,7 +2678,6 @@ clear_operation_policy_tst:
     name: tst
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "clear_operation_policy"
-      when: manual
   script:
     - !reference [.clear_operation_policy, script]
 

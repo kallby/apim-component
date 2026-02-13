@@ -82,7 +82,7 @@ Repeat for `TST_`, `STG_`, and `PRD_` prefixes.
 
 ### `get_global_policy`
 
-Retrieve and display the current global policy (read-only, no approval required).
+Retrieve and display the current global policy (read-only operation, approval required).
 
 ```
 Required: (none)
@@ -138,8 +138,18 @@ The component automatically selects the environment based on the branch:
 1. **Validate** - Validates inputs and policy XML syntax
 2. **Backup** - Creates backup of current global policy (skips if none exists)
 3. **Plan** - Shows current policy and planned changes
-4. **Notify** - Sends email to approvers (if configured)
+4. **Notify** - Sends email to approvers
 5. **Deploy** - Manual approval required, then applies the policy
+
+## Approval & Notification Rules
+
+| Operation | All Branches |
+|-----------|--------------|
+| `get_global_policy` | Approval Required |
+| `set_global_policy` | Approval Required |
+| `clear_global_policy` | Approval Required |
+
+**Notifications:** Email notifications are sent to approvers for all operations on all branches.
 
 ## Automatic Backups
 
