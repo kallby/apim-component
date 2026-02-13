@@ -58,8 +58,8 @@ variables:
       # Sensitive operation (shows keys)
       - "get_subscription_keys"
       # Write operations
-      - "create_subscription"
-      - "delete_subscription"
+      - "create_product_subscription"
+      - "delete_product_subscription"
       - "regenerate_primary_key"
       - "regenerate_secondary_key"
       - "regenerate_both_keys"
@@ -72,17 +72,9 @@ variables:
     value: ""
     description: "Display name for new subscription (for create)"
 
-  SCOPE_TYPE:
-    value: "product"
-    description: "Subscription scope type"
-    options:
-      - "product"    # Subscription to a specific product
-      - "api"        # Subscription to a specific API
-      - "all_apis"   # Service-level subscription (access to all APIs)
-
-  SCOPE_ID:
+  PRODUCT_ID:
     value: ""
-    description: "Product ID or API ID (required for product/api scope, ignored for all_apis)"
+    description: "Product ID (required for create_subscription)"
 
   SUBSCRIPTION_STATE:
     value: "active"
@@ -650,7 +642,7 @@ validate_inputs:
 
       # Validate operation
       case "$OPERATION" in
-        create_subscription|delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
+        create_product_subscription|delete_product_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
           log_ok "Valid operation: $OPERATION"
           ;;
         *)
@@ -661,41 +653,20 @@ validate_inputs:
 
       # Validate required inputs per operation
       case "$OPERATION" in
-        create_subscription)
+        create_product_subscription)
           if [ -z "$SUBSCRIPTION_NAME" ]; then
-            log_error "SUBSCRIPTION_NAME is required for create_subscription"
+            log_error "SUBSCRIPTION_NAME is required for $OPERATION"
             exit 1
           fi
-          if [ -z "$SCOPE_TYPE" ]; then
-            log_error "SCOPE_TYPE is required for create_subscription"
+          if [ -z "$PRODUCT_ID" ]; then
+            log_error "PRODUCT_ID is required for $OPERATION"
             exit 1
           fi
-          # Validate scope-specific requirements
-          case "$SCOPE_TYPE" in
-            product|api)
-              if [ -z "$SCOPE_ID" ]; then
-                log_error "SCOPE_ID is required when SCOPE_TYPE is '$SCOPE_TYPE'"
-                exit 1
-              fi
-              log_info "Scope Type: $SCOPE_TYPE"
-              log_info "Scope ID: $SCOPE_ID"
-              ;;
-            all_apis)
-              log_info "Scope Type: $SCOPE_TYPE (service-level access to all APIs)"
-              if [ -n "$SCOPE_ID" ]; then
-                log_warn "SCOPE_ID is ignored for 'all_apis' scope type"
-              fi
-              ;;
-            *)
-              log_error "Invalid SCOPE_TYPE: $SCOPE_TYPE (valid options: product, api, all_apis)"
-              exit 1
-              ;;
-          esac
+          log_info "Product ID: $PRODUCT_ID"
           log_info "Subscription Name: $SUBSCRIPTION_NAME"
           log_info "Subscription State: $SUBSCRIPTION_STATE"
-          log_info "Allow Tracing: $ALLOW_TRACING"
           ;;
-        delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
+        delete_product_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)
           if [ -z "$SUBSCRIPTION_ID" ]; then
             log_error "SUBSCRIPTION_ID is required for $OPERATION"
             exit 1
@@ -734,7 +705,7 @@ plan:
       echo ""
 
       # Validate subscription exists for operations that require it
-      if [ "$OPERATION" != "create_subscription" ] && [ -n "$SUBSCRIPTION_ID" ]; then
+      if [ "$OPERATION" != "create_product_subscription" ] && [ -n "$SUBSCRIPTION_ID" ]; then
         log_info "Validating subscription ID: $SUBSCRIPTION_ID"
 
         SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
@@ -793,7 +764,7 @@ plan:
       fi
 
       case "$OPERATION" in
-        create_subscription)
+        create_product_subscription)
           # Generate the subscription ID that will be used
           PLAN_SUB_ID="$(echo "$SUBSCRIPTION_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')-$(date +%m%d%Y%H%M)"
 
@@ -802,22 +773,11 @@ plan:
           echo "Subscription Configuration:"
           echo "  Subscription ID:         $PLAN_SUB_ID"
           echo "  Display Name:            $SUBSCRIPTION_NAME"
-          echo "  Scope Type:              $SCOPE_TYPE"
-          case "$SCOPE_TYPE" in
-            product)
-              echo "  Scope:                   Product: $SCOPE_ID"
-              ;;
-            api)
-              echo "  Scope:                   API: $SCOPE_ID"
-              ;;
-            all_apis)
-              echo "  Scope:                   All APIs (service-level)"
-              ;;
-          esac
+          echo "  Product ID:              $PRODUCT_ID"
           echo "  State:                   $SUBSCRIPTION_STATE"
           echo "  Allow Tracing:           $ALLOW_TRACING"
           ;;
-        delete_subscription)
+        delete_product_subscription)
           echo "Action: DELETE subscription (DESTRUCTIVE)"
           echo ""
           echo "  Subscription ID:         $SUBSCRIPTION_ID"
@@ -876,7 +836,7 @@ notify_approvers:
   image: $IMAGE_PYTHON
   needs: ["plan"]
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_subscription|delete_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)$/
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product_subscription|delete_product_subscription|get_subscription_keys|regenerate_primary_key|regenerate_secondary_key|regenerate_both_keys)$/
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   cache:
@@ -1200,7 +1160,7 @@ notify_approvers:
               log_error(f"SMTP error: {e}")
               return False
 
-      def get_action_details(operation, subscription_id, subscription_name, scope_type, scope_id, subscription_state, allow_tracing, scope_display=None, display_name=None):
+      def get_action_details(operation, subscription_id, subscription_name, product_id, subscription_state, allow_tracing, scope_display=None, display_name=None):
           """Generate human-readable action description and changes list for each operation.
 
           Args:
@@ -1214,15 +1174,9 @@ notify_approvers:
           # For existing subscriptions, use fetched display_name if available
           sub_display = display_name or subscription_id
 
-          if operation == 'create_subscription':
+          if operation == 'create_product_subscription':
               action_title = "Create New Subscription"
-              # Build scope description
-              if scope_type == 'product':
-                  scope_desc = f"Product: {scope_id}"
-              elif scope_type == 'api':
-                  scope_desc = f"API: {scope_id}"
-              else:
-                  scope_desc = "All APIs (service-level access)"
+              scope_desc = f"Product: {product_id}"
 
               action_desc = f"A new APIM subscription will be created with access to {scope_desc}."
               changes = [
@@ -1233,7 +1187,7 @@ notify_approvers:
                   "Primary and secondary API keys will be generated"
               ]
 
-          elif operation == 'delete_subscription':
+          elif operation == 'delete_product_subscription':
               action_title = "Delete Subscription"
               action_desc = f"The subscription <code>{sub_display}</code> will be permanently deleted."
               changes = [
@@ -1381,8 +1335,7 @@ notify_approvers:
           triggered_by = os.environ.get('GITLAB_USER_NAME', 'Unknown')
           subscription_id = os.environ.get('SUBSCRIPTION_ID', '')
           subscription_name = os.environ.get('SUBSCRIPTION_NAME', '')
-          scope_type = os.environ.get('SCOPE_TYPE', '')
-          scope_id = os.environ.get('SCOPE_ID', '')
+          product_id = os.environ.get('PRODUCT_ID', '')
           subscription_state = os.environ.get('SUBSCRIPTION_STATE', 'active')
           allow_tracing = os.environ.get('ALLOW_TRACING', 'false')
           lob = os.environ.get('CI_PROJECT_ROOT_NAMESPACE', 'Unknown')
@@ -1392,7 +1345,7 @@ notify_approvers:
           scope_display = None
           display_name = None
 
-          if subscription_id and operation != 'create_subscription':
+          if subscription_id and operation != 'create_product_subscription':
               az_tenant_id = os.environ.get('AZ_TENANT_ID', '')
               az_client_id = os.environ.get('AZ_SPN_CLIENT_ID', '')
               az_client_secret = os.environ.get('AZ_SPN_CLIENT_SECRET', '')
@@ -1429,7 +1382,7 @@ notify_approvers:
           timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
 
           # Risk indicator for destructive/sensitive operations
-          destructive_ops = ['delete_subscription', 'regenerate_primary_key', 'regenerate_secondary_key', 'regenerate_both_keys']
+          destructive_ops = ['delete_product_subscription', 'regenerate_primary_key', 'regenerate_secondary_key', 'regenerate_both_keys']
           sensitive_ops = ['get_subscription_keys']
           is_destructive = operation in destructive_ops
           is_sensitive = operation in sensitive_ops
@@ -1437,7 +1390,7 @@ notify_approvers:
           # Get action details
           action_title, action_desc, changes = get_action_details(
               operation, subscription_id, subscription_name,
-              scope_type, scope_id, subscription_state, allow_tracing,
+              product_id, subscription_state, allow_tracing,
               scope_display=scope_display, display_name=display_name
           )
 
@@ -1585,7 +1538,7 @@ notify_approvers:
 # ============================================
 # Script Templates
 # ============================================
-.create_subscription:
+.create_product_subscription:
   script:
     - |
       log_info "=========================================="
@@ -1597,27 +1550,10 @@ notify_approvers:
 
       log_info "Generated subscription ID: $SUBSCRIPTION_ID"
       log_info "Display Name: $SUBSCRIPTION_NAME"
-      log_info "Scope Type: $SCOPE_TYPE"
+      log_info "Product ID: $PRODUCT_ID"
 
-      # Build scope based on type
-      case "$SCOPE_TYPE" in
-        product)
-          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/products/${SCOPE_ID}"
-          log_info "Scope: Product - $SCOPE_ID"
-          ;;
-        api)
-          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/apis/${SCOPE_ID}"
-          log_info "Scope: API - $SCOPE_ID"
-          ;;
-        all_apis)
-          SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/apis"
-          log_info "Scope: All APIs (service-level)"
-          ;;
-        *)
-          log_error "Invalid SCOPE_TYPE: $SCOPE_TYPE"
-          exit 1
-          ;;
-      esac
+      # Build scope for product
+      SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/products/${PRODUCT_ID}"
 
       SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
 
@@ -1646,7 +1582,7 @@ notify_approvers:
 
       if [ $CREATE_EXIT_CODE -eq 0 ] && echo "$CREATE_OUTPUT" | jq -e '.name' > /dev/null 2>&1; then
         log_ok "Subscription created successfully"
-        log_audit "create_subscription" "$SUBSCRIPTION_ID" "name=$SUBSCRIPTION_NAME,scope_type=$SCOPE_TYPE,scope_id=${SCOPE_ID:-all_apis}"
+        log_audit "create_product_subscription" "$SUBSCRIPTION_ID" "name=$SUBSCRIPTION_NAME,product_id=$PRODUCT_ID"
         echo ""
         echo "Subscription Details:"
         echo "$CREATE_OUTPUT" | jq '{
@@ -1673,7 +1609,7 @@ notify_approvers:
         exit 1
       fi
 
-.delete_subscription:
+.delete_product_subscription:
   script:
     - |
       log_info "=========================================="
@@ -1691,12 +1627,12 @@ notify_approvers:
 
       if [ $DELETE_EXIT_CODE -eq 0 ]; then
         log_ok "Subscription deleted"
-        log_audit "delete_subscription" "$SUBSCRIPTION_ID" "status=deleted"
+        log_audit "delete_product_subscription" "$SUBSCRIPTION_ID" "status=deleted"
       else
         # Check if the error is "subscription not found" which is acceptable
         if echo "$DELETE_OUTPUT" | grep -qi "not found\|does not exist"; then
           log_warn "Subscription not found (already deleted)"
-          log_audit "delete_subscription" "$SUBSCRIPTION_ID" "status=not_found"
+          log_audit "delete_product_subscription" "$SUBSCRIPTION_ID" "status=not_found"
         else
           log_error "Failed to delete subscription"
           log_error "Error: $DELETE_OUTPUT"
@@ -2073,28 +2009,6 @@ notify_approvers:
 # ============================================
 # Deploy Jobs - Dev Environment
 # ============================================
-create_subscription_dev:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: dev
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
-      when: manual
-  script:
-    - !reference [.create_subscription, script]
-
-delete_subscription_dev:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: dev
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
-      when: manual
-  script:
-    - !reference [.delete_subscription, script]
-
 get_subscription_keys_dev:
   extends: .deploy_base
   needs: ["validate_inputs", "plan"]
@@ -2139,31 +2053,31 @@ regenerate_both_keys_dev:
   script:
     - !reference [.regenerate_both_keys, script]
 
+create_product_subscription_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
+      when: manual
+  script:
+    - !reference [.create_product_subscription, script]
+
+delete_product_subscription_dev:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
+      when: manual
+  script:
+    - !reference [.delete_product_subscription, script]
+
 # ============================================
 # Deploy Jobs - Test Environment
 # ============================================
-create_subscription_tst:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: tst
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
-      when: manual
-  script:
-    - !reference [.create_subscription, script]
-
-delete_subscription_tst:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: tst
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
-      when: manual
-  script:
-    - !reference [.delete_subscription, script]
-
 get_subscription_keys_tst:
   extends: .deploy_base
   needs: ["validate_inputs", "plan"]
@@ -2208,31 +2122,31 @@ regenerate_both_keys_tst:
   script:
     - !reference [.regenerate_both_keys, script]
 
+create_product_subscription_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
+      when: manual
+  script:
+    - !reference [.create_product_subscription, script]
+
+delete_product_subscription_tst:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: tst
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
+      when: manual
+  script:
+    - !reference [.delete_product_subscription, script]
+
 # ============================================
 # Deploy Jobs - Staging Environment
 # ============================================
-create_subscription_stg:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: stg
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
-      when: manual
-  script:
-    - !reference [.create_subscription, script]
-
-delete_subscription_stg:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: stg
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
-      when: manual
-  script:
-    - !reference [.delete_subscription, script]
-
 get_subscription_keys_stg:
   extends: .deploy_base
   needs: ["validate_inputs", "plan"]
@@ -2277,31 +2191,31 @@ regenerate_both_keys_stg:
   script:
     - !reference [.regenerate_both_keys, script]
 
+create_product_subscription_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
+      when: manual
+  script:
+    - !reference [.create_product_subscription, script]
+
+delete_product_subscription_stg:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: stg
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
+      when: manual
+  script:
+    - !reference [.delete_product_subscription, script]
+
 # ============================================
 # Deploy Jobs - Production Environment
 # ============================================
-create_subscription_prd:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: prd
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_subscription"
-      when: manual
-  script:
-    - !reference [.create_subscription, script]
-
-delete_subscription_prd:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: prd
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_subscription"
-      when: manual
-  script:
-    - !reference [.delete_subscription, script]
-
 get_subscription_keys_prd:
   extends: .deploy_base
   needs: ["validate_inputs", "plan"]
@@ -2345,3 +2259,25 @@ regenerate_both_keys_prd:
       when: manual
   script:
     - !reference [.regenerate_both_keys, script]
+
+create_product_subscription_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
+      when: manual
+  script:
+    - !reference [.create_product_subscription, script]
+
+delete_product_subscription_prd:
+  extends: .deploy_base
+  needs: ["validate_inputs", "plan"]
+  environment:
+    name: prd
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
+      when: manual
+  script:
+    - !reference [.delete_product_subscription, script]

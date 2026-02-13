@@ -16,12 +16,12 @@ Then run the pipeline from the GitLab UI and select your operation.
 ## Features
 
 - List and view subscriptions across the APIM instance
-- Create subscriptions with flexible scope (product, API, or all APIs)
+- Create product-scoped subscriptions
 - Retrieve subscription keys (with approval required)
 - Regenerate primary, secondary, or both keys
 - Delete subscriptions
 - Multi-environment deployments (dev, tst, stg, prd)
-- Email notifications to approvers with product/scope details
+- Email notifications to approvers with product details
 - Audit logging
 
 ## Operations Quick Reference
@@ -30,30 +30,18 @@ Then run the pipeline from the GitLab UI and select your operation.
 |-----------|-------------|-------------------|----------|
 | `list_subscriptions` | List all subscriptions | - | No |
 | `get_subscription` | Get subscription details | `SUBSCRIPTION_ID` | No |
-| `create_subscription` | Create new subscription | `SUBSCRIPTION_NAME`, `SCOPE_TYPE`, `SCOPE_ID`* | Yes |
-| `delete_subscription` | Delete subscription | `SUBSCRIPTION_ID` | Yes |
+| `create_product_subscription` | Create new subscription | `SUBSCRIPTION_NAME`, `PRODUCT_ID` | Yes |
+| `delete_product_subscription` | Delete subscription | `SUBSCRIPTION_ID` | Yes |
 | `get_subscription_keys` | Show primary & secondary keys | `SUBSCRIPTION_ID` | **Yes** |
 | `regenerate_primary_key` | Regenerate primary key | `SUBSCRIPTION_ID` | Yes |
 | `regenerate_secondary_key` | Regenerate secondary key | `SUBSCRIPTION_ID` | Yes |
 | `regenerate_both_keys` | Regenerate both keys at once | `SUBSCRIPTION_ID` | Yes |
 
-*`SCOPE_ID` not required when `SCOPE_TYPE` is `all_apis`
-
-## Subscription Scopes
-
-Subscriptions can be scoped to different levels:
-
-| Scope Type | Description | SCOPE_ID Required |
-|------------|-------------|-------------------|
-| `product` | Access to all APIs in a specific product | Yes (Product ID) |
-| `api` | Access to a specific API only | Yes (API ID) |
-| `all_apis` | Service-level access to all APIs | No |
-
 ## Default Values
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCOPE_TYPE` | `product` | Subscription scope type |
+| `PRODUCT_ID` | _(empty)_ | Product ID for the subscription |
 | `SUBSCRIPTION_STATE` | `active` | Initial state (`active`, `suspended`, `cancelled`) |
 | `ALLOW_TRACING` | `false` | Enable request tracing |
 | `SEND_KEYS_VIA_EMAIL` | `true` | Send retrieved keys via email instead of displaying in logs |
@@ -110,20 +98,19 @@ Get details of a specific subscription (metadata only, not keys).
 
 ### Write Operations (Approval Required)
 
-#### `create_subscription`
+#### `create_product_subscription`
 
-Create a new subscription with flexible scope.
+Create a new subscription for a product.
 
 **Required inputs:**
 - `SUBSCRIPTION_NAME` - Display name for the subscription
-- `SCOPE_TYPE` - Type of scope (`product`, `api`, or `all_apis`)
-- `SCOPE_ID` - Product ID or API ID (required for `product` and `api` scopes)
+- `PRODUCT_ID` - ID of the product
 
 **Optional inputs:**
 - `SUBSCRIPTION_STATE` - Initial state (default: `active`)
 - `ALLOW_TRACING` - Enable request tracing (default: `false`)
 
-#### `delete_subscription`
+#### `delete_product_subscription`
 
 Delete a subscription permanently.
 
@@ -235,7 +222,7 @@ When an operation requires approval, email notifications are sent to configured 
 
 - **Operation details** - What action is being requested
 - **Subscription information** - Display name and ID
-- **Product/Scope information** - Which product or API the subscription is associated with
+- **Product information** - Which product the subscription is associated with
 - **Environment** - Target environment (dev, tst, stg, prd)
 - **Risk indicators** - Warnings for destructive or sensitive operations
 - **Direct link** - Link to the pipeline for review and approval
@@ -267,38 +254,18 @@ All operations are logged to `audit-{pipeline_id}.json` and saved as a pipeline 
 
 ## Examples
 
-### Create a Product-Scoped Subscription
+### Create a Subscription
 
 1. Go to CI/CD > Pipelines > Run pipeline
 2. Select branch: `dev`
 3. Set variables:
-   - `OPERATION`: `create_subscription`
+   - `OPERATION`: `create_product_subscription`
    - `SUBSCRIPTION_NAME`: `Partner ABC Production`
-   - `SCOPE_TYPE`: `product`
-   - `SCOPE_ID`: `premium-tier`
+   - `PRODUCT_ID`: `premium-tier`
 4. Click "Run pipeline"
 5. Review the plan
 6. Approve the deploy job
-
-### Create an API-Scoped Subscription
-
-1. Run pipeline on the appropriate branch
-2. Set variables:
-   - `OPERATION`: `create_subscription`
-   - `SUBSCRIPTION_NAME`: `Mobile App - Orders API`
-   - `SCOPE_TYPE`: `api`
-   - `SCOPE_ID`: `orders-api`
-3. Review and approve
-
-### Create a Service-Level Subscription (All APIs)
-
-1. Run pipeline on the appropriate branch
-2. Set variables:
-   - `OPERATION`: `create_subscription`
-   - `SUBSCRIPTION_NAME`: `Internal Service Account`
-   - `SCOPE_TYPE`: `all_apis`
-   - `SCOPE_ID`: _(leave empty)_
-3. Review and approve
+7. Retrieve subscription keys using `get_subscription_keys` or Azure Portal
 
 ### Retrieve Subscription Keys
 
@@ -361,28 +328,28 @@ To find valid subscription IDs:
 
 Verify that all required `{ENV}_*` variables are set for the branch you're running on.
 
-### "SCOPE_ID is required"
+### "PRODUCT_ID is required"
 
-When `SCOPE_TYPE` is `product` or `api`, you must provide the corresponding `SCOPE_ID`. Only `all_apis` scope type doesn't require a `SCOPE_ID`.
+When creating a subscription, you must provide the `PRODUCT_ID` for the product the subscription will be scoped to.
 
-### "Product/API not found" when creating subscription
+### "Product not found" when creating subscription
 
-Ensure the product or API exists in APIM before creating a subscription scoped to it. Use the `apim-products` or `apim-api` components to create them first.
+Ensure the product exists in APIM before creating a subscription for it. Use the `apim-products` component to create products first.
 
 ### Keys not displaying
 
 The `get_subscription_keys` operation requires manual approval due to the sensitive nature of the data. Make sure you approve the deploy job after reviewing the plan.
 
-## Differences from apim-products Subscriptions
+## Differences from apim-products
 
-This component (`apim-subscriptions`) manages subscriptions at the APIM service level with flexible scope options. The `apim-products` component also has subscription operations, but they are specifically for product-scoped subscriptions.
+This component (`apim-subscriptions`) is the central component for all subscription management in APIM. It includes:
 
-Use this component when you need:
-- Service-level subscriptions (access to all APIs)
-- API-specific subscriptions
-- Full key management (viewing and regenerating keys)
-- Centralized subscription management across products
+- **Create/delete subscriptions**: Product-scoped subscriptions
+- **Key management**: View, regenerate primary, secondary, or both keys
+- **Centralized management**: All subscription operations in one place
 
-Use `apim-products` subscriptions when you need:
-- Simple product-scoped subscriptions
-- Subscription management as part of product lifecycle
+The `apim-products` component provides:
+- `list_product_subscriptions` to view subscriptions for a product
+- All other product management operations (create/update/delete products, policies, groups, API associations)
+
+> **Migration Note:** The `create_product_subscription` and `delete_product_subscription` operations have been moved from `apim-products` to this component for centralized subscription management.

@@ -19,11 +19,13 @@ Then run the pipeline from the GitLab UI and select your operation.
 - Associate/disassociate APIs with products
 - Manage product-level policies
 - Control product visibility with groups
-- Create and manage subscriptions
+- List subscriptions for a product
 - Automatic vendor product detection and prefixing
 - Multi-environment deployments (dev, tst, stg, prd)
 - Email notifications to approvers
 - Audit logging
+
+> **Note:** To create or delete subscriptions, use the `apim-subscriptions` component which provides full subscription management including key retrieval and rotation.
 
 ## Operations Quick Reference
 
@@ -44,8 +46,6 @@ Then run the pipeline from the GitLab UI and select your operation.
 | `add_group_to_product` | Add visibility group | `PRODUCT_NAME` |
 | `remove_group_from_product` | Remove visibility group | `PRODUCT_NAME`, `GROUP_NAME` |
 | `list_product_subscriptions` | List subscriptions | `PRODUCT_NAME` |
-| `create_product_subscription` | Create subscription | `PRODUCT_NAME`, `SUBSCRIPTION_NAME` |
-| `delete_product_subscription` | Delete subscription | `SUBSCRIPTION_ID` |
 
 ## Default Values
 
@@ -60,7 +60,6 @@ The following variables have default values and don't need to be provided unless
 | `SUBSCRIPTIONS_LIMIT` | _(unlimited)_ | Maximum subscriptions allowed |
 | `TERMS_OF_USE` | _(empty)_ | Legal terms for the product |
 | `GROUP_NAME` | `developers` | Default group for visibility operations |
-| `SUBSCRIPTION_STATE` | `active` | Subscription state (`active`, `suspended`, `cancelled`) |
 | `DEBUG_MODE` | `false` | Enable verbose logging |
 
 ## Required CI/CD Variables
@@ -253,22 +252,11 @@ List all subscriptions for a product (read-only).
 **Required inputs:**
 - `PRODUCT_NAME` - ID of the product
 
-#### `create_product_subscription`
-
-Create a new subscription for a product.
-
-**Required inputs:**
-- `PRODUCT_NAME` - ID of the product
-- `SUBSCRIPTION_NAME` - Display name for the subscription
-
-Subscription state defaults to `active`. See [Default Values](#default-values) to override.
-
-#### `delete_product_subscription`
-
-Delete a subscription.
-
-**Required inputs:**
-- `SUBSCRIPTION_ID` - ID of the subscription to delete
+> **Note:** To create or delete subscriptions, use the `apim-subscriptions` component which provides:
+> - `create_product_subscription` - Create a subscription for a product
+> - `delete_product_subscription` - Delete a subscription
+> - Full key management (retrieve, regenerate)
+> - Flexible scope options (product, API, or all APIs)
 
 ## Built-in Groups
 
@@ -322,11 +310,9 @@ The component automatically selects the environment based on the branch:
 | `clear_product_policy` | Auto | Approval Required |
 | `add_group_to_product` | Auto | Approval Required |
 | `remove_group_from_product` | Auto | Approval Required |
-| `create_product_subscription` | Approval Required | Approval Required |
-| `delete_product_subscription` | Approval Required | Approval Required |
 
 **Notifications:**
-- **dev/tst branches:** Email notifications are sent only for `create_product_subscription` and `delete_product_subscription` operations.
+- **dev/tst branches:** No email notifications (auto-deploy).
 - **stg/prd branches:** Email notifications are sent for all operations requiring approval.
 
 ## Audit Logging
@@ -375,16 +361,6 @@ All operations are logged to `audit-{pipeline_id}.json` and saved as a pipeline 
    - `PRODUCT_NAME`: `premium-tier`
    - `GROUP_NAME`: `developers`
 3. Review and approve
-
-### Create a Subscription
-
-1. Run pipeline on the appropriate branch
-2. Set variables:
-   - `OPERATION`: `create_product_subscription`
-   - `PRODUCT_NAME`: `premium-tier`
-   - `SUBSCRIPTION_NAME`: `Partner ABC Production`
-3. Review and approve
-4. Retrieve subscription keys from Azure Portal
 
 ## Product Policy Example
 

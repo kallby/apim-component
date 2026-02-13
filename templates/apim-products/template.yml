@@ -70,10 +70,8 @@ variables:
       - "list_product_groups"
       - "add_group_to_product"
       - "remove_group_from_product"
-      # Subscription operations
+      # Subscription operations (read-only)
       - "list_product_subscriptions"
-      - "create_product_subscription"
-      - "delete_product_subscription"
 
   PRODUCT_TYPE:
     value: "internal"
@@ -137,25 +135,6 @@ variables:
   # GROUP_NAME:
   #   value: ""
   #   description: "Group name to add/remove from product (e.g., 'developers', 'guests', 'administrators')"
-
-  # -----------------------------------------------
-  # Subscription Management
-  # -----------------------------------------------
-  SUBSCRIPTION_NAME:
-    value: ""
-    description: "Display name for the subscription (for create_product_subscription)"
-
-  SUBSCRIPTION_ID:
-    value: ""
-    description: "Subscription ID (for delete_product_subscription)"
-
-  SUBSCRIPTION_STATE:
-    value: "active"
-    description: "Subscription state"
-    options:
-      - "active"
-      - "suspended"
-      - "cancelled"
 
   DEBUG_MODE:
     value: "false"
@@ -643,7 +622,7 @@ validate_inputs:
 
       # Validate operation
       case "$OPERATION" in
-        create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product|create_product_subscription|delete_product_subscription)
+        create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product)
           log_ok "Valid operation: $OPERATION"
           ;;
         *)
@@ -735,26 +714,6 @@ validate_inputs:
           fi
           log_info "Product Name: $PRODUCT_NAME"
           log_info "Group Name: $GROUP_NAME"
-          ;;
-        create_product_subscription)
-          if [ -z "$PRODUCT_NAME" ]; then
-            log_error "PRODUCT_NAME is required for create_product_subscription"
-            exit 1
-          fi
-          if [ -z "$SUBSCRIPTION_NAME" ]; then
-            log_error "SUBSCRIPTION_NAME is required for create_product_subscription"
-            exit 1
-          fi
-          log_info "Product Name: $PRODUCT_NAME"
-          log_info "Subscription Name: $SUBSCRIPTION_NAME"
-          log_info "Subscription State: $SUBSCRIPTION_STATE"
-          ;;
-        delete_product_subscription)
-          if [ -z "$SUBSCRIPTION_ID" ]; then
-            log_error "SUBSCRIPTION_ID is required for delete_product_subscription"
-            exit 1
-          fi
-          log_info "Subscription ID: $SUBSCRIPTION_ID"
           ;;
       esac
 
@@ -1005,23 +964,6 @@ plan:
           echo "  Product Name (ID):       $PRODUCT_NAME"
           echo "  Group Name:              $GROUP_NAME"
           ;;
-        create_product_subscription)
-          # Generate the subscription ID that will be used
-          PLAN_SUB_ID="${PRODUCT_NAME}-sub-<timestamp>"
-          echo "Action: Create subscription for product"
-          echo ""
-          echo "  Product Name (ID):       $PRODUCT_NAME"
-          echo "  Subscription ID:         $PLAN_SUB_ID"
-          echo "  Subscription Name:       $SUBSCRIPTION_NAME"
-          echo "  Subscription State:      $SUBSCRIPTION_STATE"
-          ;;
-        delete_product_subscription)
-          echo "Action: DELETE subscription (DESTRUCTIVE)"
-          echo ""
-          echo "  Subscription ID:         $SUBSCRIPTION_ID"
-          echo ""
-          echo "WARNING: This will permanently delete the subscription!"
-          ;;
       esac
 
       echo ""
@@ -1035,10 +977,8 @@ notify_approvers:
   image: $IMAGE_PYTHON
   needs: ["plan"]
   rules:
-    # For dev/tst branches, only notify for subscription operations (which still require approval)
-    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop|tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product_subscription|delete_product_subscription)$/
     # For stg/prd branches, notify for all deploy operations
-    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging|prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product|create_product_subscription|delete_product_subscription)$/
+    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging|prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION =~ /^(create_product|update_product|delete_product|add_api_to_product|remove_api_from_product|set_product_policy|clear_product_policy|add_group_to_product|remove_group_from_product)$/
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   cache:
@@ -1341,7 +1281,7 @@ notify_approvers:
           timestamp = now_eastern.strftime('%Y-%m-%d %I:%M:%S %p ET')
 
           # Risk indicator for destructive operations
-          destructive_ops = ['delete_product', 'clear_product_policy', 'remove_api_from_product', 'remove_group_from_product', 'delete_product_subscription']
+          destructive_ops = ['delete_product', 'clear_product_policy', 'remove_api_from_product', 'remove_group_from_product']
           is_destructive = operation in destructive_ops
 
           policy_url = build_file_url(os.environ.get('POLICY_REPO_URL'), os.environ.get('POLICY_REPO_BRANCH', 'main'), policy_file)
@@ -1883,95 +1823,6 @@ notify_approvers:
         fi
       fi
 
-.create_product_subscription:
-  script:
-    - |
-      log_info "=========================================="
-      log_info "Creating Subscription for Product"
-      log_info "Product: $PRODUCT_NAME | Name: $SUBSCRIPTION_NAME"
-      log_info "=========================================="
-
-      # Generate subscription ID from display name (lowercase, hyphenated)
-      # Format: {product-id}-sub-{timestamp} to ensure uniqueness
-      SUBSCRIPTION_ID="${PRODUCT_NAME}-sub-$(date +%s)"
-
-      log_info "Generated subscription ID: $SUBSCRIPTION_ID"
-
-      SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
-
-      # Build scope for product
-      SCOPE="/subscriptions/${AZ_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_SERVICE}/products/${PRODUCT_NAME}"
-
-      REQUEST_BODY=$(jq -n \
-        --arg displayName "$SUBSCRIPTION_NAME" \
-        --arg scope "$SCOPE" \
-        --arg state "$SUBSCRIPTION_STATE" \
-        '{
-          "properties": {
-            "displayName": $displayName,
-            "scope": $scope,
-            "state": $state
-          }
-        }')
-
-      log_info "Creating subscription with scope: $SCOPE"
-
-      log_debug "Creating subscription at: $SUBSCRIPTION_URL"
-      log_debug "Request body: $REQUEST_BODY"
-      CREATE_OUTPUT=$(az rest --method PUT \
-        --url "$SUBSCRIPTION_URL" \
-        --headers "Content-Type=application/json" \
-        --body "$REQUEST_BODY" \
-        --output none 2>&1)
-      CREATE_EXIT_CODE=$?
-
-      if [ $CREATE_EXIT_CODE -eq 0 ]; then
-        log_ok "Subscription created successfully"
-        log_audit "create_product_subscription" "$PRODUCT_NAME" "subscription_id=$SUBSCRIPTION_ID,name=$SUBSCRIPTION_NAME"
-        echo ""
-        echo "Subscription Details:"
-        echo "  ID: $SUBSCRIPTION_ID"
-        echo "  Display Name: $SUBSCRIPTION_NAME"
-        echo "  State: $SUBSCRIPTION_STATE"
-        echo ""
-        echo "NOTE: Retrieve subscription keys from Azure Portal or via API"
-      else
-        log_error "Failed to create subscription"
-        log_error "Error: $CREATE_OUTPUT"
-        exit 1
-      fi
-
-.delete_product_subscription:
-  script:
-    - |
-      log_info "=========================================="
-      log_info "Deleting Subscription: $SUBSCRIPTION_ID"
-      log_info "=========================================="
-
-      SUBSCRIPTION_URL="${APIM_BASE_URL}/subscriptions/${SUBSCRIPTION_ID}?api-version=${AZURE_API_VERSION}"
-
-      log_debug "Deleting subscription at: $SUBSCRIPTION_URL"
-      DELETE_OUTPUT=$(az rest --method DELETE \
-        --url "$SUBSCRIPTION_URL" \
-        --headers "Content-Type=application/json" \
-        --output none 2>&1)
-      DELETE_EXIT_CODE=$?
-
-      if [ $DELETE_EXIT_CODE -eq 0 ]; then
-        log_ok "Subscription deleted"
-        log_audit "delete_product_subscription" "$SUBSCRIPTION_ID" "status=deleted"
-      else
-        # Check if the error is "subscription not found" which is acceptable
-        if echo "$DELETE_OUTPUT" | grep -qi "not found\|does not exist"; then
-          log_warn "Subscription not found (already deleted)"
-          log_audit "delete_product_subscription" "$SUBSCRIPTION_ID" "status=not_found"
-        else
-          log_error "Failed to delete subscription"
-          log_error "Error: $DELETE_OUTPUT"
-          exit 1
-        fi
-      fi
-
 # ============================================
 # Deploy Jobs - Dev Environment
 # ============================================
@@ -2065,28 +1916,6 @@ remove_group_from_product_dev:
   script:
     - !reference [.remove_group_from_product, script]
 
-create_product_subscription_dev:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: dev
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
-      when: manual
-  script:
-    - !reference [.create_product_subscription, script]
-
-delete_product_subscription_dev:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: dev
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(dev|develop)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
-      when: manual
-  script:
-    - !reference [.delete_product_subscription, script]
-
 # ============================================
 # Deploy Jobs - Test Environment
 # ============================================
@@ -2179,28 +2008,6 @@ remove_group_from_product_tst:
     - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "remove_group_from_product"
   script:
     - !reference [.remove_group_from_product, script]
-
-create_product_subscription_tst:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: tst
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
-      when: manual
-  script:
-    - !reference [.create_product_subscription, script]
-
-delete_product_subscription_tst:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: tst
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(tst|test)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
-      when: manual
-  script:
-    - !reference [.delete_product_subscription, script]
 
 # ============================================
 # Deploy Jobs - Staging Environment
@@ -2304,28 +2111,6 @@ remove_group_from_product_stg:
   script:
     - !reference [.remove_group_from_product, script]
 
-create_product_subscription_stg:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: stg
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
-      when: manual
-  script:
-    - !reference [.create_product_subscription, script]
-
-delete_product_subscription_stg:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: stg
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(stg|staging)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
-      when: manual
-  script:
-    - !reference [.delete_product_subscription, script]
-
 # ============================================
 # Deploy Jobs - Production Environment
 # ============================================
@@ -2427,25 +2212,3 @@ remove_group_from_product_prd:
       when: manual
   script:
     - !reference [.remove_group_from_product, script]
-
-create_product_subscription_prd:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: prd
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "create_product_subscription"
-      when: manual
-  script:
-    - !reference [.create_product_subscription, script]
-
-delete_product_subscription_prd:
-  extends: .deploy_base
-  needs: ["validate_inputs", "plan"]
-  environment:
-    name: prd
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^(prd|main)$/ && $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $OPERATION == "delete_product_subscription"
-      when: manual
-  script:
-    - !reference [.delete_product_subscription, script]
